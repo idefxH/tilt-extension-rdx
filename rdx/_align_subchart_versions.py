@@ -96,7 +96,7 @@ def main(parent_dir):
                 os.replace(new_tgz, tgz)
                 fixed += 1
                 print(
-                    "[suse_rda] aligned {0} {1} -> {2}".format(name, cy.get("version"), want),
+                    "[rdx] aligned {0} {1} -> {2}".format(name, cy.get("version"), want),
                     flush=True,
                 )
         finally:
@@ -104,7 +104,7 @@ def main(parent_dir):
                 shutil.rmtree(work)
     if fixed:
         print(
-            "[suse_rda] patched {0} sub-chart Chart.yaml version(s) under {1}".format(
+            "[rdx] patched {0} sub-chart Chart.yaml version(s) under {1}".format(
                 fixed, parent_dir
             ),
             flush=True,

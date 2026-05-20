@@ -34,7 +34,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 SKIP_TOP = {
-    "suse-library", "global", "image", "ingress",
+    "rdx-library", "global", "image", "ingress",
     "imagePullSecrets", "resources", "probes", "metrics",
     "podAnnotations", "service", "name", "replicas",
     "port", "apiVersion", "kind",
@@ -57,7 +57,7 @@ def _is_redacted(s):
     """Mirror of the Tiltfile-embedded helper.
 
     Fallback safety net. The PRIMARY fix is `_is_overlay_file` below:
-    skip services[] from the rda-generated overlay where redacted
+    skip services[] from the rdx-generated overlay where redacted
     markers originate.
     """
     if not isinstance(s, str):
@@ -68,7 +68,7 @@ def _is_redacted(s):
 def _is_overlay_file(path):
     """Mirror of the Tiltfile-embedded helper.
 
-    Root-cause fix: skip services[] when reading the rda render
+    Root-cause fix: skip services[] when reading the rdx render
     overlay. The overlay projects services[] with values_mapping
     applied and may contain redacted-secret markers in the projected
     fields. The user's values.yaml is the source of truth for
@@ -78,9 +78,9 @@ def _is_overlay_file(path):
     if not path:
         return False
     p = path.replace("\\", "/")
-    return (p.endswith("/.rda/values.generated.yaml") or
+    return (p.endswith("/.rdx/values.generated.yaml") or
             p.endswith("/values.generated.yaml") or
-            p == ".rda/values.generated.yaml" or
+            p == ".rdx/values.generated.yaml" or
             p == "values.generated.yaml")
 
 
@@ -107,7 +107,7 @@ def enabled_charts(values_files, dsl_mappings=None):
         if not isinstance(data, dict):
             continue
         is_overlay = _is_overlay_file(path)
-        sl = data.get("suse-library")
+        sl = data.get("rdx-library")
         if isinstance(sl, dict):
             for name, sub in sl.items():
                 if isinstance(sub, dict) and sub.get("enabled") is True:
@@ -183,7 +183,7 @@ def filter_deps(full_deps, enabled, values_files):
                 data = yaml.safe_load(f) or {}
         except Exception:
             continue
-        sl = data.get("suse-library")
+        sl = data.get("rdx-library")
         if not isinstance(sl, dict):
             continue
         services = sl.get("services") or []
@@ -241,7 +241,7 @@ def filter_deps(full_deps, enabled, values_files):
 # Representative Chart.yaml with 16 deps (the full catalog).
 FULL_CHART_YAML = {
     "apiVersion": "v2",
-    "name": "suse-library",
+    "name": "rdx-library",
     "version": "0.1.0",
     "dependencies": [
         {"name": "postgresql",     "version": "0.4.4-29.1", "repository": "oci://dp.apps.rancher.io/charts", "condition": "postgresql.enabled"},
@@ -305,7 +305,7 @@ def report(name, ok, detail=""):
 
 def test_basic_filtering():
     """Only enabled services' deps are kept (16 deps, 2 enabled)."""
-    tmpdir = tempfile.mkdtemp(prefix="rda-test-filter-")
+    tmpdir = tempfile.mkdtemp(prefix="rdx-test-filter-")
     try:
         # Write Chart.yaml.full (source of truth).
         chart_yaml_full = os.path.join(tmpdir, "Chart.yaml.full")
@@ -315,7 +315,7 @@ def test_basic_filtering():
         # Write values.yaml with postgresql + redis enabled.
         values_path = os.path.join(tmpdir, "values.yaml")
         values = {
-            "suse-library": {
+            "rdx-library": {
                 "services": [
                     {"type": "postgresql", "binding": "db",    "enabled": True,
                      "auth": {"user": {"password": "dev", "database": "app"},
@@ -349,11 +349,11 @@ def test_basic_filtering():
 
 def test_multi_instance_aliasing():
     """Two grafana bindings expand to two aliased deps (#24)."""
-    tmpdir = tempfile.mkdtemp(prefix="rda-test-filter-")
+    tmpdir = tempfile.mkdtemp(prefix="rdx-test-filter-")
     try:
         values_path = os.path.join(tmpdir, "values.yaml")
         values = {
-            "suse-library": {
+            "rdx-library": {
                 "services": [
                     {"type": "grafana", "binding": "metrics",    "enabled": True,
                      "auth": {"admin": {"password": "dev"}}},
@@ -417,11 +417,11 @@ def test_multi_instance_aliasing():
 
 def test_preserves_existing_aliases():
     """dex-idp aliased as dex stays intact after filtering."""
-    tmpdir = tempfile.mkdtemp(prefix="rda-test-filter-")
+    tmpdir = tempfile.mkdtemp(prefix="rdx-test-filter-")
     try:
         values_path = os.path.join(tmpdir, "values.yaml")
         values = {
-            "suse-library": {
+            "rdx-library": {
                 "services": [
                     {"type": "dex", "binding": "auth", "enabled": True,
                      "ingress": {"enabled": True,
@@ -464,11 +464,11 @@ def test_preserves_existing_aliases():
 
 def test_disabled_services_excluded():
     """Services with enabled=false are not kept."""
-    tmpdir = tempfile.mkdtemp(prefix="rda-test-filter-")
+    tmpdir = tempfile.mkdtemp(prefix="rdx-test-filter-")
     try:
         values_path = os.path.join(tmpdir, "values.yaml")
         values = {
-            "suse-library": {
+            "rdx-library": {
                 "services": [
                     {"type": "postgresql", "binding": "db", "enabled": True,
                      "auth": {"user": {"password": "dev", "database": "app"},
@@ -502,10 +502,10 @@ def test_disabled_services_excluded():
 
 def test_empty_services():
     """No services enabled => no deps kept."""
-    tmpdir = tempfile.mkdtemp(prefix="rda-test-filter-")
+    tmpdir = tempfile.mkdtemp(prefix="rdx-test-filter-")
     try:
         values_path = os.path.join(tmpdir, "values.yaml")
-        values = {"suse-library": {"services": []}}
+        values = {"rdx-library": {"services": []}}
         with open(values_path, "w") as f:
             yaml.safe_dump(values, f, default_flow_style=False)
 
@@ -531,11 +531,11 @@ def test_connect_provisioning_skips_operator_subchart():
     breaking k8s_resource registration with a redacted-secret host
     name. The connect-mode entry must be invisible to the filter.
     """
-    tmpdir = tempfile.mkdtemp(prefix="rda-test-filter-")
+    tmpdir = tempfile.mkdtemp(prefix="rdx-test-filter-")
     try:
         values_path = os.path.join(tmpdir, "values.yaml")
         values = {
-            "suse-library": {
+            "rdx-library": {
                 "services": [
                     {"type": "postgresql", "binding": "db", "enabled": True,
                      "provisioning": "connect",
@@ -582,11 +582,11 @@ def test_deploy_provisioning_pulls_operator_subchart():
     when the user does want an in-cluster postgres, chart_defaults
     expansion still adds cnpg + cloudnative-pg.
     """
-    tmpdir = tempfile.mkdtemp(prefix="rda-test-filter-")
+    tmpdir = tempfile.mkdtemp(prefix="rdx-test-filter-")
     try:
         values_path = os.path.join(tmpdir, "values.yaml")
         values = {
-            "suse-library": {
+            "rdx-library": {
                 "services": [
                     {"type": "postgresql", "binding": "db", "enabled": True,
                      "provisioning": "deploy"},
@@ -630,11 +630,11 @@ def test_provisioning_absent_defaults_to_deploy():
     Pre-DSL projects and fresh scaffolds that don't set provisioning
     must keep working — the gate is opt-OUT of deploy, not opt-IN.
     """
-    tmpdir = tempfile.mkdtemp(prefix="rda-test-filter-")
+    tmpdir = tempfile.mkdtemp(prefix="rdx-test-filter-")
     try:
         values_path = os.path.join(tmpdir, "values.yaml")
         values = {
-            "suse-library": {
+            "rdx-library": {
                 "services": [
                     {"type": "redis", "binding": "cache", "enabled": True,
                      "auth": {"password": "dev"}},
@@ -669,11 +669,11 @@ def test_mixed_connect_and_deploy():
     shared external postgres for analytics. The connect entry must
     NOT cancel the operator pull from the deploy entry.
     """
-    tmpdir = tempfile.mkdtemp(prefix="rda-test-filter-")
+    tmpdir = tempfile.mkdtemp(prefix="rdx-test-filter-")
     try:
         values_path = os.path.join(tmpdir, "values.yaml")
         values = {
-            "suse-library": {
+            "rdx-library": {
                 "services": [
                     {"type": "postgresql", "binding": "db", "enabled": True,
                      "provisioning": "deploy"},
@@ -717,11 +717,11 @@ def test_mixed_connect_and_deploy():
 def test_shared_and_external_also_skipped():
     """`shared` and `external` provisioning also skip operator pulls."""
     for mode in ("shared", "external"):
-        tmpdir = tempfile.mkdtemp(prefix="rda-test-filter-")
+        tmpdir = tempfile.mkdtemp(prefix="rdx-test-filter-")
         try:
             values_path = os.path.join(tmpdir, "values.yaml")
             values = {
-                "suse-library": {
+                "rdx-library": {
                     "services": [
                         {"type": "postgresql", "binding": "db", "enabled": True,
                          "provisioning": mode},
@@ -751,7 +751,7 @@ def test_shared_and_external_also_skipped():
 # ---------------------------------------------------------------------------
 
 def _bad_workload_name(s):
-    """Mirror of the Tiltfile-embedded helper in suse_app()."""
+    """Mirror of the Tiltfile-embedded helper in rdx_app()."""
     if not s or not s.strip():
         return True
     if '{{' in s or '}}' in s:
@@ -762,11 +762,11 @@ def _bad_workload_name(s):
 
 
 def test_overlay_services_block_skipped():
-    """ROOT-CAUSE FIX: services[] from rda's overlay must be ignored.
+    """ROOT-CAUSE FIX: services[] from rdx's overlay must be ignored.
 
     Reproduction of the reported scenario:
       - User's values.yaml has clean DSL: services[].type=grafana etc.
-      - rda render writes chart/.rda/values.generated.yaml with a
+      - rdx render writes chart/.rdx/values.generated.yaml with a
         projected services[] block whose `type` fields are
         `[redacted secret demo-<binding>-binding:type]` because the
         bundle's values_mapping routes type through a binding secret.
@@ -777,12 +777,12 @@ def test_overlay_services_block_skipped():
     is skipped, no redacted markers reach the enabled set, the
     correct chart deps end up in Chart.yaml.
     """
-    tmpdir = tempfile.mkdtemp(prefix="rda-test-filter-")
+    tmpdir = tempfile.mkdtemp(prefix="rdx-test-filter-")
     try:
         # 1. User's clean DSL in values.yaml
         values_path = os.path.join(tmpdir, "values.yaml")
         values = {
-            "suse-library": {
+            "rdx-library": {
                 "services": [
                     {"type": "grafana",    "binding": "dashboards", "enabled": True,
                      "provisioning": "deploy"},
@@ -798,14 +798,14 @@ def test_overlay_services_block_skipped():
         with open(values_path, "w") as f:
             yaml.safe_dump(values, f, default_flow_style=False)
 
-        # 2. rda render overlay at the canonical path. Its services[]
+        # 2. rdx render overlay at the canonical path. Its services[]
         # has redacted types and CHART-level enabled flags that the
         # filter SHOULD still pick up.
-        overlay_dir = os.path.join(tmpdir, ".rda")
+        overlay_dir = os.path.join(tmpdir, ".rdx")
         os.makedirs(overlay_dir)
         overlay_path = os.path.join(overlay_dir, "values.generated.yaml")
         overlay = {
-            "suse-library": {
+            "rdx-library": {
                 # Polluted projected services[] — last-wins would
                 # normally let these win over values.yaml.
                 "services": [
@@ -830,7 +830,7 @@ def test_overlay_services_block_skipped():
             yaml.safe_dump(overlay, f, default_flow_style=False)
 
         # File order matches what the filter is invoked with:
-        #   filter_enabled_deps.py <sub> values.yaml .rda/values.generated.yaml
+        #   filter_enabled_deps.py <sub> values.yaml .rdx/values.generated.yaml
         enabled = enabled_charts([values_path, overlay_path],
                                  dsl_mappings=DSL_MAPPINGS_PG)
 
@@ -903,12 +903,12 @@ def test_overlay_only_carries_no_services():
     from services[], not pollute it with redacted markers from the
     overlay's projected services[].
     """
-    tmpdir = tempfile.mkdtemp(prefix="rda-test-filter-")
+    tmpdir = tempfile.mkdtemp(prefix="rdx-test-filter-")
     try:
-        os.makedirs(os.path.join(tmpdir, ".rda"))
-        overlay_path = os.path.join(tmpdir, ".rda", "values.generated.yaml")
+        os.makedirs(os.path.join(tmpdir, ".rdx"))
+        overlay_path = os.path.join(tmpdir, ".rdx", "values.generated.yaml")
         overlay = {
-            "suse-library": {
+            "rdx-library": {
                 "services": [
                     {"type": "[redacted secret X:type]",
                      "binding": "x", "enabled": True, "provisioning": "deploy"},
@@ -937,17 +937,17 @@ def test_overlay_only_carries_no_services():
 def test_is_overlay_file_helper():
     """_is_overlay_file recognises canonical + legacy overlay paths."""
     cases = [
-        ("chart/.rda/values.generated.yaml",                True,  "canonical relative"),
-        ("/abs/path/to/chart/.rda/values.generated.yaml",   True,  "canonical absolute"),
+        ("chart/.rdx/values.generated.yaml",                True,  "canonical relative"),
+        ("/abs/path/to/chart/.rdx/values.generated.yaml",   True,  "canonical absolute"),
         ("chart/values.generated.yaml",                     True,  "legacy relative"),
         ("/abs/chart/values.generated.yaml",                True,  "legacy absolute"),
-        (".rda/values.generated.yaml",                      True,  "bare canonical"),
+        (".rdx/values.generated.yaml",                      True,  "bare canonical"),
         ("values.generated.yaml",                           True,  "bare legacy"),
         ("chart/values.yaml",                               False, "user values.yaml"),
         ("chart/staging-values.yaml",                       False, "user override file"),
         ("",                                                False, "empty"),
         (None,                                              False, "None"),
-        ("chart/.rda/something-else.yaml",                  False, "other file in .rda dir"),
+        ("chart/.rdx/something-else.yaml",                  False, "other file in .rdx dir"),
     ]
     for inp, expected, desc in cases:
         got = _is_overlay_file(inp)
@@ -964,18 +964,18 @@ def test_redacted_type_skipped_in_enabled_set():
     Exact reproduction of the reported bug:
       - User has `services[]` with type=grafana (binding=dashboards)
         and type=prometheus (binding=metrics), both in deploy mode.
-      - A bundle bug routes `type` through rda's secret redactor, so
+      - A bundle bug routes `type` through rdx's secret redactor, so
         the values the Tiltfile sees have `type: '[redacted secret
         demo-dashboards-binding:type]'` instead of `type: grafana`.
       - The filter must not add the marker to the enabled set
         (otherwise it propagates into Chart.yaml dep names) and must
         not crash.
     """
-    tmpdir = tempfile.mkdtemp(prefix="rda-test-filter-")
+    tmpdir = tempfile.mkdtemp(prefix="rdx-test-filter-")
     try:
         values_path = os.path.join(tmpdir, "values.yaml")
         values = {
-            "suse-library": {
+            "rdx-library": {
                 "services": [
                     {"type": "[redacted secret demo-dashboards-binding:type]",
                      "binding": "dashboards", "enabled": True,
@@ -1031,11 +1031,11 @@ def test_redacted_type_alone_yields_no_deps():
     bug), the filter must produce an empty Chart.yaml deps list, not
     crash and not propagate the markers.
     """
-    tmpdir = tempfile.mkdtemp(prefix="rda-test-filter-")
+    tmpdir = tempfile.mkdtemp(prefix="rdx-test-filter-")
     try:
         values_path = os.path.join(tmpdir, "values.yaml")
         values = {
-            "suse-library": {
+            "rdx-library": {
                 "services": [
                     {"type": "[redacted secret demo-a-binding:type]",
                      "binding": "a", "enabled": True, "provisioning": "deploy"},
@@ -1079,11 +1079,11 @@ def test_redacted_dep_name_dropped_from_kept():
     # Manually craft an enabled set that includes the marker, as would
     # happen if upstream defenses failed.
     enabled = {"postgresql", "[redacted secret demo-db-binding:type]"}
-    tmpdir = tempfile.mkdtemp(prefix="rda-test-filter-")
+    tmpdir = tempfile.mkdtemp(prefix="rdx-test-filter-")
     try:
         values_path = os.path.join(tmpdir, "values.yaml")
         with open(values_path, "w") as f:
-            yaml.safe_dump({"suse-library": {"services": []}}, f)
+            yaml.safe_dump({"rdx-library": {"services": []}}, f)
         kept = filter_deps(full_deps, enabled, [values_path])
         kept_names = [d.get("name") for d in kept]
         report(

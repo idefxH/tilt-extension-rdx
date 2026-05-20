@@ -1,14 +1,14 @@
-# tilt-extension-suse-rda — suse_app() helper.
+# tilt-extension-rdx — rdx_app() helper.
 #
 # Wraps Cloud Native Buildpacks (via `pack`), Helm install, and service
 # port-forwarding into a single declarative call. Designed for projects
-# scaffolded by `rda new` from a SUSE Rancher Developer Access opinion
+# scaffolded by `rdx new` from a Rancher Developer eXperience opinion
 # bundle, but usable from any Tiltfile that wants the same conventions.
 #
 # Usage in a project's Tiltfile:
 #
-#   load_dynamic('https://raw.githubusercontent.com/idefxH/tilt-extension-suse-rda/main/Tiltfile')
-#   suse_app(
+#   load_dynamic('https://raw.githubusercontent.com/idefxH/tilt-extension-rdx/main/Tiltfile')
+#   rdx_app(
 #       name='my-app',
 #       language='nodejs',
 #   )
@@ -17,9 +17,9 @@
 # with one call. Service port-forwards are auto-discovered from the
 # project's values.yaml (under deploy/ on bundle 0.11.13+ scaffolds, or
 # chart/ on older ones — chart_path defaults to auto-detection): every
-# `suse-library.services[]` entry (the unified DSL written by `rda
+# `rdx-library.services[]` entry (the unified DSL written by `rdx
 # add-service`) is registered. The app's HTTP port is read from
-# `suse-library.port` in the same values.yaml — values.yaml is the source
+# `rdx-library.port` in the same values.yaml — values.yaml is the source
 # of truth, so the Tiltfile stays terse. Override builder_image when
 # SUSE-AppCo buildpacks ship.
 #
@@ -32,14 +32,14 @@
 # built-in allowlist (kind, microk8s, minikube, docker-desktop, …)
 # because a `local()` against a prod cluster could nuke prod from a
 # dev's laptop. This extension shells out via `local()` for helm
-# dep-update bootstrap, the chart-alignment script, `rda namespace
+# dep-update bootstrap, the chart-alignment script, `rdx namespace
 # expand`, etc. — all unavoidable — so the refusal blocks the whole
 # Tiltfile. CI runs (GitHub Actions + k3s, context `rancher-desktop`)
 # and any custom context name (k3d-*, a user's kubectl rename) trip it.
 #
 # Must be called at module top level: Tilt resolves the allowlist
-# before any function body runs, so calling it from inside suse_app()
-# is too late — the first `local()` inside suse_app() blows up before
+# before any function body runs, so calling it from inside rdx_app()
+# is too late — the first `local()` inside rdx_app() blows up before
 # the allowlist mutation takes effect.
 #
 # Safe to allow whatever context is active: the user already pointed
@@ -59,7 +59,7 @@ allow_k8s_contexts(k8s_context())
 # ephemeral-lifecycle container. Reproduces with every Paketo tag we
 # tested (jammy-base, jammy-full, all versions). Net: not actionable on
 # our side until Paketo or AppCo publishes an arm64 builder. Tracked in
-# tilt-extension-suse-rda#1 for the AppCo migration.
+# tilt-extension-rdx#1 for the AppCo migration.
 #
 # Heroku 24 series: builder ~400MB (vs Paketo full 1.5GB), ships
 # heroku/nodejs (active, v5.5.8 on 2026-04-16), heroku/python,
@@ -127,7 +127,7 @@ LANGUAGE_DEFAULTS = {
 }
 
 # Optional registry redirect for CI / local-mirror / air-gapped setups.
-# When SUSE_RDA_DEFAULT_REGISTRY is set, register it as Tilt's default
+# When RDX_DEFAULT_REGISTRY is set, register it as Tilt's default
 # registry so custom_build's $EXPECTED_REF and any chart images get
 # rewritten to that host. The e2e harness uses this to point at the
 # local kind-mirror (localhost:5000) without having to inject a
@@ -135,16 +135,16 @@ LANGUAGE_DEFAULTS = {
 #
 # Top-level on purpose: Tilt requires default_registry() before any
 # image builds are registered, so it has to run at extension load
-# time — not inside suse_app().
-_suse_rda_default_registry = os.getenv('SUSE_RDA_DEFAULT_REGISTRY', '')
-if _suse_rda_default_registry:
-    default_registry(_suse_rda_default_registry)
+# time — not inside rdx_app().
+_rdx_default_registry = os.getenv('RDX_DEFAULT_REGISTRY', '')
+if _rdx_default_registry:
+    default_registry(_rdx_default_registry)
 
 # Disable Tilt's secret-value scrubber for binding-secret values.
 #
-# The rda library-chart writes Service-Binding-Spec-compliant Secrets
+# The rdx library-chart writes Service-Binding-Spec-compliant Secrets
 # whose stringData contains the chart `type` (`postgresql`, `prometheus`,
-# `grafana`, `dex`, ...) and `provider` (`rda-appco`). The SBS REQUIRES
+# `grafana`, `dex`, ...) and `provider` (`rdx-appco`). The SBS REQUIRES
 # `type` to live in the Secret data — that's not optional. Tilt then
 # harvests every Secret value it deploys and substitutes the literal
 # strings everywhere in its log/UI output, so a workload named
@@ -164,9 +164,9 @@ if _suse_rda_default_registry:
 # unintelligible workload names AND doesn't actually protect against
 # anything since `type=prometheus` isn't a secret in the first place.
 #
-# Set SUSE_RDA_ENABLE_TILT_SCRUB=1 to opt back in (e.g. for screen-shared
+# Set RDX_ENABLE_TILT_SCRUB=1 to opt back in (e.g. for screen-shared
 # demos where the dev wants password redaction in the UI).
-if os.getenv('SUSE_RDA_ENABLE_TILT_SCRUB', '') != '1':
+if os.getenv('RDX_ENABLE_TILT_SCRUB', '') != '1':
     secret_settings(disable_scrub=True)
 
 # Conventional ports for service types declared in `services`. Used by
@@ -175,7 +175,7 @@ if os.getenv('SUSE_RDA_ENABLE_TILT_SCRUB', '') != '1':
 # doesn't declare a port for the chart type (older bundles, charts
 # not in the catalog). New charts should declare their port in
 # dsl-mappings.yaml instead of adding to this dict.
-def suse_app(
+def rdx_app(
         name,
         language=None,
         port=None,
@@ -202,23 +202,23 @@ def suse_app(
 
     Common:
         port (int|None): HTTP port exposed by the app container. **Default
-            None — derived from `suse-library.port` in chart/values.yaml.**
+            None — derived from `rdx-library.port` in chart/values.yaml.**
             The library chart already reads `.Values.port` as the
             container's port AND the Service's targetPort, so values.yaml
             is the source of truth. Don't pass this argument unless you
             need to override; if you pass a value that mismatches
             values.yaml, the Tiltfile fails fast (forcing the dev to fix
             the duplication rather than carry two drifting numbers). When
-            values.yaml has no `suse-library.port` entry, falls back to
+            values.yaml has no `rdx-library.port` entry, falls back to
             the library chart's own default of 8080.
         services (dict|None): map of service binding name -> service type.
             Port-forwards are resolved from dsl-mappings.yaml (data-driven).
             Example: {'database': 'postgresql'}.
             **When None (default), services are auto-discovered from
-            chart_values_files** — every entry in `suse-library.services[]`
-            (the unified DSL) and every chart with `suse-library.<chart>.enabled:
+            chart_values_files** — every entry in `rdx-library.services[]`
+            (the unified DSL) and every chart with `rdx-library.<chart>.enabled:
             true` (the legacy gate) is registered. This is the recommended
-            mode: `rda service add <type> <binding>` updates values.yaml,
+            mode: `rdx service add <type> <binding>` updates values.yaml,
             and Tilt picks up the change on the next reload — nothing in the
             Tiltfile needs to be in lockstep with values.yaml.
             Pass an explicit dict to opt out of auto-discovery (e.g. to
@@ -260,7 +260,7 @@ def suse_app(
     """
     if not helm_only and not image_ref:
         if language not in LANGUAGE_DEFAULTS:
-            fail('suse_app: unsupported language %r. Supported: %s' % (
+            fail('rdx_app: unsupported language %r. Supported: %s' % (
                 language, ', '.join(sorted(LANGUAGE_DEFAULTS.keys()))))
 
     # Auto-detect chart_path when caller didn't pass one. Prefer deploy/
@@ -284,14 +284,14 @@ def suse_app(
             chart_path = 'chart'
 
     # ─── Stage auto-detection ──────────────────────────────────────────
-    # Resolve the RDA stage once, used by every `rda render --stage`
+    # Resolve the RDX stage once, used by every `rdx render --stage`
     # call below. Priority:
-    #   1. RDA_STAGE env var (explicit override, e.g. CI).
-    #   2. .rda/stage file at the project root (written by `rda stage`).
+    #   1. RDX_STAGE env var (explicit override, e.g. CI).
+    #   2. .rdx/stage file at the project root (written by `rdx stage`).
     #   3. Fallback to 'dev' (safe default for inner-loop).
-    _stage = os.getenv('RDA_STAGE', '')
+    _stage = os.getenv('RDX_STAGE', '')
     if not _stage:
-        _stage_file = os.path.join(chart_path, '..', '.rda', 'stage')
+        _stage_file = os.path.join(chart_path, '..', '.rdx', 'stage')
         if os.path.exists(_stage_file):
             _stage = str(read_file(_stage_file)).strip()
     if not _stage:
@@ -320,22 +320,22 @@ def suse_app(
     #      ordering guarantee versus image-build / k8s_yaml registration
     #      below.
     #
-    # Namespace expansion: shell out to `rda namespace expand` (single
-    # source of truth, rda-cli 0.1.47+), with a Starlark fallback for
-    # older rda binaries. Reads `.rda/project.yaml` namespace.local,
+    # Namespace expansion: shell out to `rdx namespace expand` (single
+    # source of truth, rdx-cli 0.1.47+), with a Starlark fallback for
+    # older rdx binaries. Reads `.rdx/project.yaml` namespace.local,
     # substitutes {{.project}} / {{.user}}.
-    rda_can_expand = str(local(
-        'command -v rda > /dev/null 2>&1 && rda namespace --help > /dev/null 2>&1 && echo yes || echo no',
+    rdx_can_expand = str(local(
+        'command -v rdx > /dev/null 2>&1 && rdx namespace --help > /dev/null 2>&1 && echo yes || echo no',
         quiet=True, echo_off=True)).strip()
-    if rda_can_expand == 'yes':
-        namespace = str(local('rda namespace expand', quiet=True, echo_off=True)).strip()
+    if rdx_can_expand == 'yes':
+        namespace = str(local('rdx namespace expand', quiet=True, echo_off=True)).strip()
         if not namespace:
-            fail('suse_app: `rda namespace expand` returned empty output. Check `.rda/project.yaml`.')
+            fail('rdx_app: `rdx namespace expand` returned empty output. Check `.rdx/project.yaml`.')
     else:
         # Legacy fallback: in-Tiltfile expander (kept simple — covers UC1
         # and UC2 patterns; for richer cases the user should upgrade to
-        # rda-cli 0.1.47+ which owns the canonical logic).
-        project_meta = read_yaml('.rda/project.yaml', default={})
+        # rdx-cli 0.1.47+ which owns the canonical logic).
+        project_meta = read_yaml('.rdx/project.yaml', default={})
         ns_template = ((project_meta.get('namespace', {}) or {}).get('local', '') or '{{.project}}')
         user_value = str(local('echo "${USER:-default}"', quiet=True, echo_off=True)).strip() or 'default'
         namespace = ns_template
@@ -344,10 +344,10 @@ def suse_app(
             namespace = namespace.replace(token, value)
         if '{{' in namespace or '}}' in namespace:
             fail((
-                'suse_app: namespace template %r contains an unrecognised token ' +
+                'rdx_app: namespace template %r contains an unrecognised token ' +
                 'after expansion (got %r). Allowed tokens: {{.project}}, {{.user}}. ' +
-                'Edit .rda/project.yaml namespace.local to fix, or install rda 0.1.47+ ' +
-                'so this extension can shell out to `rda namespace expand` instead.'
+                'Edit .rdx/project.yaml namespace.local to fix, or install rdx 0.1.47+ ' +
+                'so this extension can shell out to `rdx namespace expand` instead.'
             ) % (ns_template, namespace))
 
     # Pre-create the namespace idempotently. Tilt invokes `helm template`
@@ -363,7 +363,7 @@ def suse_app(
     # Mirror the application-collection imagePullSecret from `default` to
     # the deploy namespace if it's missing. Background:
     #   - The Application Collection Rancher Desktop extension installs
-    #     the Secret in `default` only. With NS Phase A (rda 0.1.43+),
+    #     the Secret in `default` only. With NS Phase A (rdx 0.1.43+),
     #     every project deploys to its own namespace (`{{.project}}` or
     #     a multi-dev `{{.project}}-{{.user}}` template), so the Secret
     #     is never automatically present where it's needed.
@@ -385,8 +385,8 @@ def suse_app(
     # Three escape hatches to coexist with operator-managed distribution
     # (kubernetes-reflector / External Secrets / GitOps / manual):
     #
-    #   1. Env var SUSE_RDA_SKIP_PULLSECRET_MIRROR=1 (cluster-wide).
-    #   2. Namespace label rda.suse.com/pullsecret-managed-by=operator
+    #   1. Env var RDX_SKIP_PULLSECRET_MIRROR=1 (cluster-wide).
+    #   2. Namespace label rdx.io/pullsecret-managed-by=operator
     #      — set this on a project NS to declare "an operator owns the
     #      pullsecret here, hands off". Per-NS, persistent in YAML.
     #   3. Source-side annotation: if Secret/application-collection in
@@ -398,7 +398,7 @@ def suse_app(
     #
     # Step 0 (target-NS already has it) is the universal safety net:
     # whatever distribution mechanism wrote it first, we don't touch.
-    if os.getenv('SUSE_RDA_SKIP_PULLSECRET_MIRROR', '') != '1':
+    if os.getenv('RDX_SKIP_PULLSECRET_MIRROR', '') != '1':
         local(
             "set -e; " +
             # Step 0: target NS already has the Secret — done.
@@ -406,10 +406,10 @@ def suse_app(
             ">/dev/null 2>&1; then exit 0; fi; " +
             # Step 0b: target NS is operator-managed via label.
             "if [ \"$(kubectl get ns " + namespace + " -o " +
-            "jsonpath='{.metadata.labels.rda\\.suse\\.com/pullsecret-managed-by}' " +
+            "jsonpath='{.metadata.labels.rdx\\.io/pullsecret-managed-by}' " +
             "2>/dev/null)\" = 'operator' ]; then " +
-            "echo '[suse_rda] skipping pullsecret mirror " +
-            "(ns " + namespace + " labelled rda.suse.com/pullsecret-managed-by=operator)'; " +
+            "echo '[rdx] skipping pullsecret mirror " +
+            "(ns " + namespace + " labelled rdx.io/pullsecret-managed-by=operator)'; " +
             "exit 0; fi; " +
             # Step 0c: source Secret is operator-managed (ESO / reflector).
             # Don't fight the operator — step back and let its controller
@@ -417,24 +417,24 @@ def suse_app(
             "if [ -n \"$(kubectl get secret -n default application-collection -o " +
             "jsonpath='{.metadata.annotations.external-secrets\\.io/owned-by}' " +
             "2>/dev/null)\" ]; then " +
-            "echo '[suse_rda] skipping pullsecret mirror " +
+            "echo '[rdx] skipping pullsecret mirror " +
             "(default Secret has external-secrets.io annotation; ESO will distribute)'; " +
             "exit 0; fi; " +
             "if [ \"$(kubectl get secret -n default application-collection -o " +
             "jsonpath='{.metadata.annotations.reflector\\.v1\\.k8s\\.emberstack\\.com/reflection-allowed}' " +
             "2>/dev/null)\" = 'true' ]; then " +
-            "echo '[suse_rda] skipping pullsecret mirror " +
+            "echo '[rdx] skipping pullsecret mirror " +
             "(default Secret has reflector annotation; kubernetes-reflector will distribute)'; " +
             "exit 0; fi; " +
             # Step 1: source missing — loud fail.
             "if ! kubectl get secret -n default application-collection " +
             ">/dev/null 2>&1; then " +
-            "echo '[suse_rda] FATAL: Secret/application-collection not found " +
+            "echo '[rdx] FATAL: Secret/application-collection not found " +
             "in `default` (the AppCo Rancher Desktop extension would normally " +
             "install it there). Either install/launch the AppCo extension, " +
             "OR run `helm registry login dp.apps.rancher.io` then bootstrap " +
             "the Secret manually via kubectl create secret docker-registry; " +
-            "OR set SUSE_RDA_SKIP_PULLSECRET_MIRROR=1 if your cluster uses " +
+            "OR set RDX_SKIP_PULLSECRET_MIRROR=1 if your cluster uses " +
             "kubernetes-reflector / External Secrets to distribute it.' >&2; " +
             "exit 1; fi; " +
             # sed strips instance-bound metadata (namespace + uid +
@@ -447,12 +447,12 @@ def suse_app(
             "-e '/^  resourceVersion:/d' " +
             "-e '/^  creationTimestamp:/d' | " +
             "kubectl apply -n " + namespace + " -f - >/dev/null && " +
-            "echo '[suse_rda] mirrored Secret/application-collection " +
+            "echo '[rdx] mirrored Secret/application-collection " +
             "default -> " + namespace + "'",
             quiet=False, echo_off=True)
 
     # ─── Workloads[] detection ──────────────────────────────────────────
-    # New DSL (bundle v0.11+): `suse-library.workloads[]` array in
+    # New DSL (bundle v0.11+): `rdx-library.workloads[]` array in
     # values.yaml. Each workload carries its own image, port, ingress,
     # shape. When present, custom_build and k8s_resource iterate the
     # array; when absent, we fall back to the legacy single-image mode
@@ -461,7 +461,7 @@ def suse_app(
     if chart_values_files != None and len(chart_values_files) > 0:
         _primary_values_file = chart_values_files[0]
     _early_values = read_yaml(_primary_values_file, default={})
-    _early_lib = (_early_values.get('suse-library', {}) or {})
+    _early_lib = (_early_values.get('rdx-library', {}) or {})
     _workloads = _early_lib.get('workloads') or []
 
     # ─── Image strategy: pack build / pre-built image / helm-only ───
@@ -481,7 +481,7 @@ def suse_app(
         buildpacks = defaults['buildpacks'] + extra_buildpacks
         sync_paths = live_update_paths if live_update_paths != None else defaults['live_update_paths']
 
-        cache_dir = '/tmp/rda-pack-cache-' + name
+        cache_dir = '/tmp/rdx-pack-cache-' + name
         pack_args = ['pack', 'build', '$EXPECTED_REF',
                      '--cache', '"type=build;format=bind;source=' + cache_dir + '"',
                      '--cache', '"type=launch;format=bind;source=' + cache_dir + '-launch"',
@@ -515,10 +515,10 @@ def suse_app(
             local(
                 "set -e; " +
                 "if ! command -v go >/dev/null 2>&1; then " +
-                "echo '[suse_rda] go not on PATH; skipping go mod tidy preflight' >&2; " +
+                "echo '[rdx] go not on PATH; skipping go mod tidy preflight' >&2; " +
                 "exit 0; fi; " +
                 "if [ ! -f go.sum ] || [ go.mod -nt go.sum ]; then " +
-                "echo '[suse_rda] running go mod tidy (go.sum missing or stale)'; " +
+                "echo '[rdx] running go mod tidy (go.sum missing or stale)'; " +
                 "go mod tidy; " +
                 "fi",
                 quiet=False, echo_off=True,
@@ -551,7 +551,7 @@ def suse_app(
         # registry configured by default_registry().
         #
         # Opt-in via env var so dev behaviour stays unchanged.
-        _local_push = os.getenv('SUSE_RDA_TILT_PUSH_TO_REGISTRY') == '1'
+        _local_push = os.getenv('RDX_TILT_PUSH_TO_REGISTRY') == '1'
         _skips_local_docker = not _local_push
         _disable_push = not _local_push
 
@@ -568,7 +568,7 @@ def suse_app(
                     ref=_wl_repo,
                     command=pack_cmd,
                     deps=deps,
-                    ignore=[chart_path, 'deploy', '.rda', 'Tiltfile'],
+                    ignore=[chart_path, 'deploy', '.rdx', 'Tiltfile'],
                     match_in_env_vars=True,
                     skips_local_docker=_skips_local_docker,
                     disable_push=_disable_push,
@@ -580,7 +580,7 @@ def suse_app(
                 ref=name,
                 command=pack_cmd,
                 deps=deps,
-                ignore=[chart_path, 'deploy', '.rda', 'Tiltfile'],
+                ignore=[chart_path, 'deploy', '.rdx', 'Tiltfile'],
                 match_in_env_vars=True,
                 skips_local_docker=_skips_local_docker,
                 disable_push=_disable_push,
@@ -591,12 +591,12 @@ def suse_app(
     # files, applies the resulting manifests to the cluster.
     #
     # Run `helm dependency update` recursively. The parent chart vendors
-    # the SUSE library chart at charts/suse-library/, and the library chart
+    # the library chart at charts/rdx-library/, and the library chart
     # itself declares oci:// dependencies on AppCo charts (e.g. postgresql).
     # `helm dep update` is non-recursive — it only pulls deps for the path
     # you pass. We walk charts/*/Chart.yaml first, update each, then update
     # the parent. Without this step the AppCo sub-charts never land in
-    # charts/suse-library/charts/ and their resources never get rendered.
+    # charts/rdx-library/charts/ and their resources never get rendered.
     # Requires `helm registry login dp.apps.rancher.io` (one-time, typically
     # wired by the AppCo Rancher Desktop extension).
     # Strategy: only run helm dep update INSIDE vendored sub-chart directories.
@@ -607,12 +607,12 @@ def suse_app(
     #      and deletes any unmatched charts/, which interferes with the
     #      recursive dep-update step.
     # If the user introduces a non-vendored top-level dep later, they should
-    # vendor it (rda convention) or run helm dep update themselves.
+    # vendor it (rdx convention) or run helm dep update themselves.
     # Embed the chart-version aligning helper inline. Writing it to
     # /tmp at runtime avoids the path-discovery problem with extensions
     # loaded via ext:// (no __file__ equivalent in Starlark, and
     # read_file() resolves relative to the user's project Tiltfile).
-    align_script_path = '/tmp/_suse_rda_align_subchart_versions.py'
+    align_script_path = '/tmp/_rdx_align_subchart_versions.py'
     align_script_src = r'''#!/usr/bin/env python3
 """
 Align vendored sub-chart Chart.yaml versions with the parent's dep
@@ -711,7 +711,7 @@ def main(parent_dir):
                 os.replace(new_tgz, tgz)
                 fixed += 1
                 print(
-                    "[suse_rda] aligned {0} {1} -> {2}".format(name, cy.get("version"), want),
+                    "[rdx] aligned {0} {1} -> {2}".format(name, cy.get("version"), want),
                     flush=True,
                 )
         finally:
@@ -719,7 +719,7 @@ def main(parent_dir):
                 shutil.rmtree(work)
     if fixed:
         print(
-            "[suse_rda] patched {0} sub-chart Chart.yaml version(s) under {1}".format(
+            "[rdx] patched {0} sub-chart Chart.yaml version(s) under {1}".format(
                 fixed, parent_dir
             ),
             flush=True,
@@ -729,25 +729,25 @@ def main(parent_dir):
 if __name__ == "__main__":
     main(sys.argv[1])
 '''
-    local('cat > ' + align_script_path + " <<'__SUSE_RDA_PY_EOF__'\n" + align_script_src + "\n__SUSE_RDA_PY_EOF__", echo_off=True, quiet=True)
+    local('cat > ' + align_script_path + " <<'__RDX_PY_EOF__'\n" + align_script_src + "\n__RDX_PY_EOF__", echo_off=True, quiet=True)
 
     # Filter the library chart's deps down to ONLY the sub-charts the
     # project has enabled. Without this, every `helm dep update` pulls
     # all 7+ AppCo charts (postgresql, redis, prometheus, grafana, dex,
     # mariadb, apache-kafka, ...) on every fresh project — even when
     # the dev only enabled mariadb. Triggers AppCo rate-limits in
-    # high-iteration workflows (e2e harness, repeated `rda new`).
+    # high-iteration workflows (e2e harness, repeated `rdx new`).
     #
-    # The filter reads the project's values + the rda-render overlay,
+    # The filter reads the project's values + the rdx-render overlay,
     # builds the set of `<chart>.enabled: true` chart names, and
     # rewrites the library chart's Chart.yaml keeping only those deps.
     # Backed up to Chart.yaml.full on first run so subsequent
     # enable/disable cycles can re-derive from the full list.
     #
     # Idempotent: if Chart.yaml.full exists, restore from it before
-    # filtering. Safe across rda render re-runs (Tilt fires it on
+    # filtering. Safe across rdx render re-runs (Tilt fires it on
     # every save in the chart tree).
-    filter_script_path = '/tmp/_suse_rda_filter_enabled_deps.py'
+    filter_script_path = '/tmp/_rdx_filter_enabled_deps.py'
     filter_script_src = r'''#!/usr/bin/env python3
 """
 Strip the library Chart.yaml deps down to only the sub-charts the
@@ -757,8 +757,8 @@ AppCo rate-limits.
 
 Usage: filter_enabled_deps.py <library-chart-dir> <values-file>...
 
-Reads each values file, walks `suse-library.<chart>.enabled` AND
-top-level `<chart>.enabled` (rda render's overlay shape), unions
+Reads each values file, walks `rdx-library.<chart>.enabled` AND
+top-level `<chart>.enabled` (rdx render's overlay shape), unions
 the truthy chart names, then rewrites <library>/Chart.yaml keeping
 only deps whose `name` matches.
 
@@ -814,11 +814,11 @@ def _is_deploy_provisioning(value):
 
 
 def _is_redacted(s):
-    """True iff `s` is an rda redacted-secret marker.
+    """True iff `s` is an rdx redacted-secret marker.
 
     Used as a fallback safety net. The ROOT cause of redacted markers
     leaking into `services[].type` is documented in `_is_overlay_file`
-    below: rda render projects services[] into the overlay with
+    below: rdx render projects services[] into the overlay with
     values_mapping applied, and any service whose values_mapping
     routes `type` through a binding-secret value gets the marker
     written back. This helper catches stragglers that slip past the
@@ -831,9 +831,9 @@ def _is_redacted(s):
 
 
 def _is_overlay_file(path):
-    """True iff `path` is rda render's generated values overlay.
+    """True iff `path` is rdx render's generated values overlay.
 
-    rda render projects DSL `services[]` from the user's values.yaml
+    rdx render projects DSL `services[]` from the user's values.yaml
     into the overlay with `values_mapping` applied. For any service
     whose mapping routes a field through a binding-secret value, the
     overlay's projected field becomes a `[redacted secret <binding>-
@@ -852,16 +852,16 @@ def _is_overlay_file(path):
     rewriting, the k8s_resource registration loop) sees garbage.
 
     Path-shape: the overlay is conventionally at
-    `<chart-dir>/.rda/values.generated.yaml` (rda-cli v0.1.38+) or
+    `<chart-dir>/.rdx/values.generated.yaml` (rdx-cli v0.1.38+) or
     `<chart-dir>/values.generated.yaml` (legacy, pre-v0.1.38). Both
     are recognised here.
     """
     if not path:
         return False
     p = path.replace("\\", "/")
-    return (p.endswith("/.rda/values.generated.yaml") or
+    return (p.endswith("/.rdx/values.generated.yaml") or
             p.endswith("/values.generated.yaml") or
-            p == ".rda/values.generated.yaml" or
+            p == ".rdx/values.generated.yaml" or
             p == "values.generated.yaml")
 
 
@@ -869,11 +869,11 @@ def enabled_charts(values_files, library_dir=None):
     """Union the chart names with .enabled=true across all values files.
 
     Three shapes supported:
-      1. Static `<chart>.enabled: true` under `suse-library` (legacy).
-      2. rda render overlay's `suse-library.<chart>.enabled: true`.
+      1. Static `<chart>.enabled: true` under `rdx-library` (legacy).
+      2. rdx render overlay's `rdx-library.<chart>.enabled: true`.
       3. DSL `services[]` entries — `services[i].type` + `enabled: true`
-         (the modern path, what `rda service add` writes). Critical:
-         this filter runs BEFORE `rda render` regenerates the overlay,
+         (the modern path, what `rdx service add` writes). Critical:
+         this filter runs BEFORE `rdx render` regenerates the overlay,
          so we can't rely on shape #2 alone — services[] is the only
          source of truth at filter-time on a fresh project.
 
@@ -892,7 +892,7 @@ def enabled_charts(values_files, library_dir=None):
     """
     yaml = _yaml()
     enabled = set()
-    SKIP_TOP = {"suse-library", "global", "image", "ingress",
+    SKIP_TOP = {"rdx-library", "global", "image", "ingress",
                 "imagePullSecrets", "resources", "probes", "metrics",
                 "podAnnotations", "service", "name", "replicas",
                 "port", "apiVersion", "kind"}
@@ -907,11 +907,11 @@ def enabled_charts(values_files, library_dir=None):
         if not isinstance(data, dict):
             continue
         is_overlay = _is_overlay_file(path)
-        # Shape 1+2: under suse-library.<chart>.enabled — read from ALL
+        # Shape 1+2: under rdx-library.<chart>.enabled — read from ALL
         # files, INCLUDING the overlay. The overlay's whole point is to
         # carry chart-level `<chart>.enabled` overrides written by
-        # `rda render` for each service[] entry it processed.
-        sl = data.get("suse-library")
+        # `rdx render` for each service[] entry it processed.
+        sl = data.get("rdx-library")
         if isinstance(sl, dict):
             for name, sub in sl.items():
                 if isinstance(sub, dict) and sub.get("enabled") is True:
@@ -919,7 +919,7 @@ def enabled_charts(values_files, library_dir=None):
             # Shape 3: services[] DSL — services[i].type + enabled. The
             # CLI defaults services[].enabled to false in the scaffold,
             # so we only count entries the dev has explicitly flipped to
-            # true. Same iteration the library helpers and `rda render`
+            # true. Same iteration the library helpers and `rdx render`
             # walk; staying consistent here matters.
             #
             # OVERLAY SKIP (root-cause fix for the redacted-type bug):
@@ -1042,7 +1042,7 @@ def main(library_dir, *values_files):
     # multiple bindings. Read services[] to find multi-instance types,
     # then duplicate the original dep entry with per-binding aliases.
     # SYNC: alias formula is <type>-<binding>. Must match
-    # rda-cli/internal/render/alias.go:ComputeAliases.
+    # rdx-cli/internal/render/alias.go:ComputeAliases.
     expanded_deps = list(full_deps)
     multi_aliases = {}  # type → [alias1, alias2, ...]
     for path in values_files:
@@ -1058,7 +1058,7 @@ def main(library_dir, *values_files):
                 data = _yaml().safe_load(f) or {}
         except Exception:
             continue
-        sl = data.get("suse-library")
+        sl = data.get("rdx-library")
         if not isinstance(sl, dict):
             continue
         services = sl.get("services") or []
@@ -1130,7 +1130,7 @@ def main(library_dir, *values_files):
                     data = _yaml().safe_load(f) or {}
             except Exception:
                 continue
-            sl = data.get("suse-library")
+            sl = data.get("rdx-library")
             if not isinstance(sl, dict):
                 continue
             for entry in (sl.get("services") or []):
@@ -1161,7 +1161,7 @@ def main(library_dir, *values_files):
         project_source = ""
         project_dir = os.path.dirname(library_dir)
         project_root = os.path.dirname(project_dir)
-        project_yaml = os.path.join(project_root, ".rda", "project.yaml")
+        project_yaml = os.path.join(project_root, ".rdx", "project.yaml")
         if os.path.isfile(project_yaml):
             try:
                 with open(project_yaml) as f:
@@ -1180,7 +1180,7 @@ def main(library_dir, *values_files):
                     data = _yaml().safe_load(f) or {}
             except Exception:
                 continue
-            sl = data.get("suse-library")
+            sl = data.get("rdx-library")
             if not isinstance(sl, dict):
                 continue
             for entry in (sl.get("services") or []):
@@ -1298,7 +1298,7 @@ def main(library_dir, *values_files):
     skipped = len(full_deps) - len(kept)
     suffix = "" if wrote else " (unchanged on disk)"
     print(
-        ("[suse_rda] filter_enabled_deps: kept {0}/{1} sub-chart(s) " +
+        ("[rdx] filter_enabled_deps: kept {0}/{1} sub-chart(s) " +
          "[{2}]; skipped {3} disabled{4}").format(
             len(kept), len(full_deps),
             ", ".join(sorted([d.get("name", "?") for d in kept])) or "none",
@@ -1315,7 +1315,7 @@ if __name__ == "__main__":
         sys.exit(2)
     main(*sys.argv[1:])
 '''
-    local('cat > ' + filter_script_path + " <<'__SUSE_RDA_PY_EOF__'\n" + filter_script_src + "\n__SUSE_RDA_PY_EOF__", echo_off=True, quiet=True)
+    local('cat > ' + filter_script_path + " <<'__RDX_PY_EOF__'\n" + filter_script_src + "\n__RDX_PY_EOF__", echo_off=True, quiet=True)
 
     # Pre-flight helper: ensure every non-OCI repo URL referenced by the
     # library Chart.yaml is registered with `helm repo add` BEFORE
@@ -1327,7 +1327,7 @@ if __name__ == "__main__":
     #
     # OCI repos (oci://dp.apps.rancher.io/charts) are skipped — Helm
     # talks to them directly without an index cache.
-    bootstrap_repos_script_path = '/tmp/_suse_rda_bootstrap_helm_repos.py'
+    bootstrap_repos_script_path = '/tmp/_rdx_bootstrap_helm_repos.py'
     bootstrap_repos_script_src = r'''#!/usr/bin/env python3
 """
 Walk a library chart's Chart.yaml.full (or Chart.yaml as fallback) and
@@ -1381,7 +1381,7 @@ def _safe_name_for_url(url):
     host = re.sub(r"^https?://", "", url).split("/")[0]
     slug = re.sub(r"[^a-z0-9]+", "-", host.lower()).strip("-") or "repo"
     short = hashlib.sha256(url.encode()).hexdigest()[:6]
-    return "rda-{0}-{1}".format(slug, short)
+    return "rdx-{0}-{1}".format(slug, short)
 
 
 def main(library_dir):
@@ -1422,7 +1422,7 @@ def main(library_dir):
             pass
     if added:
         print(
-            "[suse_rda] bootstrapped {0} HTTP helm repo(s): {1}".format(
+            "[rdx] bootstrapped {0} HTTP helm repo(s): {1}".format(
                 len(added), ", ".join(u for _, u in added)
             ),
             flush=True,
@@ -1446,7 +1446,7 @@ if __name__ == "__main__":
         sys.exit(2)
     main(sys.argv[1])
 '''
-    local('cat > ' + bootstrap_repos_script_path + " <<'__SUSE_RDA_PY_EOF__'\n" + bootstrap_repos_script_src + "\n__SUSE_RDA_PY_EOF__", echo_off=True, quiet=True)
+    local('cat > ' + bootstrap_repos_script_path + " <<'__RDX_PY_EOF__'\n" + bootstrap_repos_script_src + "\n__RDX_PY_EOF__", echo_off=True, quiet=True)
 
     # Speed: skip helm dep update when the cache is fresh.
     #   - --skip-refresh: don't update the 15+ helm repos (metallb, harbor,
@@ -1468,7 +1468,7 @@ if __name__ == "__main__":
         # Filter the library's deps down to only what's enabled in the
         # project's values. Cuts AppCo OCI pulls from N (every catalog
         # chart) to k (only the ones services[] turned on) per scenario.
-        # Reads the project's values.yaml + rda render's overlay so the
+        # Reads the project's values.yaml + rdx render's overlay so the
         # filter sees both static + DSL-derived enabled flags. Idempotent:
         # backs up to Chart.yaml.full on first run, re-derives every run
         # so disable→enable cycles work.
@@ -1480,22 +1480,22 @@ if __name__ == "__main__":
         # downstream `helm-manager-<sha>` cache miss two layers later.
         '    python3 "' + filter_script_path + '" "$sub" ' +
         '      "' + chart_path + '/values.yaml" ' +
-        '      "' + chart_path + '/.rda/values.generated.yaml" || ' +
-        '      { echo "[suse_rda] FATAL: filter_enabled_deps.py failed for $sub"; exit 1; }; ' +
+        '      "' + chart_path + '/.rdx/values.generated.yaml" || ' +
+        '      { echo "[rdx] FATAL: filter_enabled_deps.py failed for $sub"; exit 1; }; ' +
         # Pre-flight: register any non-OCI helm repo referenced by the
         # library Chart.yaml.full, so the subsequent
         # `helm dep update --skip-refresh` can find their indexes.
         # Idempotent + cheap. PyYAML required (already enforced above).
         '    python3 "' + bootstrap_repos_script_path + '" "$sub" || ' +
-        '      { echo "[suse_rda] FATAL: bootstrap_helm_repos.py failed for $sub"; exit 1; }; ' +
+        '      { echo "[rdx] FATAL: bootstrap_helm_repos.py failed for $sub"; exit 1; }; ' +
         # Fast-path: lock fresh AND charts/ populated -> skip update.
         '    if [ -f "$sub/Chart.lock" ] && [ "$sub/Chart.lock" -nt "$sub/Chart.yaml" ] && ' +
         '       [ -d "$sub/charts" ] && [ -n "$(ls -A "$sub/charts" 2>/dev/null)" ]; then ' +
-        '      echo "[suse_rda] $sub deps up to date, skipping helm dep update"; ' +
+        '      echo "[rdx] $sub deps up to date, skipping helm dep update"; ' +
         '      python3 "' + align_script_path + '" "$sub"; ' +
         '      continue; ' +
         '    fi; ' +
-        '    echo "[suse_rda] helm dep update --skip-refresh $sub"; ' +
+        '    echo "[rdx] helm dep update --skip-refresh $sub"; ' +
         '    helm dependency update --skip-refresh "$sub"; ' +
         # AppCo packaging quirk: their Helm charts publish OCI artifact
         # tags like "0.4.4-29.1" but Chart.yaml inside says version
@@ -1514,7 +1514,7 @@ if __name__ == "__main__":
     # Note: values.yaml is NOT explicitly watched here. Tilt already
     # watches the chart tree (via helm()), so dev edits to values.yaml
     # trigger a reload naturally. An explicit watch_file would cause an
-    # infinite loop when reconcileHints or rda render writes back to
+    # infinite loop when reconcileHints or rdx render writes back to
     # values.yaml during the reload.
 
     # Ignore helm-managed paths so Tilt doesn't reload-loop. helm dep update
@@ -1552,17 +1552,17 @@ if __name__ == "__main__":
     if chart_values_files == None:
         chart_values_files = [chart_path + '/values.yaml']
 
-    # ─── DSL projection (rda render) ────────────────────────────────────
+    # ─── DSL projection (rdx render) ────────────────────────────────────
     # Helm resolves sub-chart values BEFORE templates run, so the library
     # chart's _helpers.tpl can't inject services[].auth.user.name into
     # postgresql.auth.username at template time. The projection has to
-    # happen out of band — `rda render` does it pre-helm. We call it here,
+    # happen out of band — `rdx render` does it pre-helm. We call it here,
     # right before `helm(...)`, so chart/values.generated.yaml is fresh
-    # for every tilt up. Spec: idefxH/rda-cli/rda.md BEHAVIOR: render.
-    # Closes idefxH/rda-opinion-bundle-example#66.
+    # for every tilt up. Spec: idefxH/rdx-cli/rdx.md BEHAVIOR: render.
+    # Closes idefxH/rdx-bundle#66.
     #
     # Wiring choices:
-    #   - We call `rda render` (NOT --check) at every tilt up. Generating
+    #   - We call `rdx render` (NOT --check) at every tilt up. Generating
     #     is fast (millisecond-class for typical projects); --check would
     #     just defer the same work to a second invocation if it found
     #     drift. CI is the right place for --check.
@@ -1572,46 +1572,46 @@ if __name__ == "__main__":
     #     (Helm's value-merge convention is later-wins, which is what we
     #     want — the projected values_mapping output overrides any stale
     #     manual entries the user may have left from before they adopted
-    #     `rda render`).
-    #   - Missing rda binary: graceful warning, no fail. Inner-loop dev
-    #     against an unreleased rda branch shouldn't be blocked. The
+    #     `rdx render`).
+    #   - Missing rdx binary: graceful warning, no fail. Inner-loop dev
+    #     against an unreleased rdx branch shouldn't be blocked. The
     #     downstream helm template will fail loud anyway via
     #     validateConsistency if the user hasn't manually maintained the
     #     equivalent values.
-    rda_present = str(local(
-        'command -v rda > /dev/null 2>&1 && echo present || echo missing',
+    rdx_present = str(local(
+        'command -v rdx > /dev/null 2>&1 && echo present || echo missing',
         quiet=True, echo_off=True)).strip()
-    if rda_present == 'present':
-        # Run from chart_path's parent: `rda render` resolves the project
+    if rdx_present == 'present':
+        # Run from chart_path's parent: `rdx render` resolves the project
         # via cwd, and the project's chart_dir is computed relative to
-        # the .rda/project.yaml location.
-        # Watch .rda/stage at project root (parent of chart_path).
+        # the .rdx/project.yaml location.
+        # Watch .rdx/stage at project root (parent of chart_path).
         # No touch — the file must exist before tilt up. If absent,
         # watch_file is a no-op (Tilt ignores missing paths).
-        stage_path_root = os.path.join(os.path.dirname(chart_path), '.rda', 'stage')
+        stage_path_root = os.path.join(os.path.dirname(chart_path), '.rdx', 'stage')
         watch_file(stage_path_root)
-        local('rda render --stage %s' % _stage, quiet=True, echo_off=False)
-        # Look for the overlay at the new path first (rda-cli v0.1.38+:
-        # chart/.rda/values.generated.yaml), then fall back to the old
+        local('rdx render --stage %s' % _stage, quiet=True, echo_off=False)
+        # Look for the overlay at the new path first (rdx-cli v0.1.38+:
+        # chart/.rdx/values.generated.yaml), then fall back to the old
         # path (chart/values.generated.yaml) for projects that were
         # rendered with an older CLI. Both are valid; whichever exists
         # is what `helm` should consume. The fallback gets the dev a
         # working tilt up while they upgrade.
-        new_overlay = chart_path + '/.rda/values.generated.yaml'
+        new_overlay = chart_path + '/.rdx/values.generated.yaml'
         old_overlay = chart_path + '/values.generated.yaml'
         if os.path.exists(new_overlay):
             generated_overlay = new_overlay
         elif os.path.exists(old_overlay):
             generated_overlay = old_overlay
-            print('suse_rda: note — using legacy ' + old_overlay +
-                  '. rda-cli v0.1.38+ writes to chart/.rda/values.generated.yaml; ' +
-                  'next `rda render` will migrate. You can delete the legacy ' +
-                  'file once chart/.rda/values.generated.yaml exists.')
+            print('rdx: note — using legacy ' + old_overlay +
+                  '. rdx-cli v0.1.38+ writes to chart/.rdx/values.generated.yaml; ' +
+                  'next `rdx render` will migrate. You can delete the legacy ' +
+                  'file once chart/.rdx/values.generated.yaml exists.')
         else:
             generated_overlay = ''
         # Only append when render actually produced the file (it does
         # unconditionally — see render.go's writeAtomic — but stay
-        # defensive in case the user is on an older rda binary that
+        # defensive in case the user is on an older rdx binary that
         # predates BEHAVIOR: render).
         if generated_overlay != '':
             # De-dup: if the user already passed the overlay in
@@ -1620,9 +1620,9 @@ if __name__ == "__main__":
             if generated_overlay not in chart_values_files:
                 chart_values_files = chart_values_files + [generated_overlay]
     else:
-        print('suse_rda: warning — `rda` not on PATH; chart/.rda/values.generated.yaml ' +
-              'will not be regenerated. Install rda CLI to keep services[] DSL ' +
-              'in sync with sub-chart values. See idefxH/rda-cli.')
+        print('rdx: warning — `rdx` not on PATH; chart/.rdx/values.generated.yaml ' +
+              'will not be regenerated. Install rdx CLI to keep services[] DSL ' +
+              'in sync with sub-chart values. See idefxH/rdx-cli.')
 
     helm_set = []
     if image_ref:
@@ -1648,7 +1648,7 @@ if __name__ == "__main__":
     #
     # Auto-discover ingress hosts from the project's values.yaml so the
     # Tilt resource card shows clickable Ingress links alongside the
-    # port-forward. Reads `suse-library.ingress` for the app, and each
+    # port-forward. Reads `rdx-library.ingress` for the app, and each
     # sub-chart's own ingress block for the services (grafana follows
     # the standard `<chart>.ingress` shape; prometheus puts it under
     # `<chart>.server.ingress`). User-defined values files override
@@ -1659,7 +1659,7 @@ if __name__ == "__main__":
         parsed_values.append(read_yaml(vfile, default={}))
         parsed_values_paths.append(vfile)
 
-    # Match the embedded filter's _is_overlay_file. The rda render
+    # Match the embedded filter's _is_overlay_file. The rdx render
     # overlay is appended LAST to chart_values_files (line ~1538), so a
     # last-wins merge of services[] across parsed_values lets the
     # overlay's projected entries overwrite the clean ones from
@@ -1672,43 +1672,43 @@ if __name__ == "__main__":
     def _is_overlay_path(p):
         if not p:
             return False
-        return (p.endswith('/.rda/values.generated.yaml') or
+        return (p.endswith('/.rdx/values.generated.yaml') or
                 p.endswith('/values.generated.yaml') or
-                p == '.rda/values.generated.yaml' or
+                p == '.rdx/values.generated.yaml' or
                 p == 'values.generated.yaml')
 
     # Derive `port` from chart/values.yaml when the caller didn't pass one.
     # The library chart's deployment.yaml renders `containerPort: {{ .Values.port }}`
     # and the Service maps Service.targetPort to the same value, so
-    # `suse-library.port` is the canonical container port. Reading it
+    # `rdx-library.port` is the canonical container port. Reading it
     # here keeps the Tiltfile DRY: callers don't have to remember to set
     # the same number in two places. Closes the same drift class as
-    # rda-cli#65 (single source of truth).
+    # rdx-cli#65 (single source of truth).
     #
     # Resolution order (last wins, matches Helm's --values stacking):
     #   1. library chart default (8080)
-    #   2. user's chart/values.yaml suse-library.port
+    #   2. user's chart/values.yaml rdx-library.port
     #   3. user-overridden values files
-    #   4. explicit port=NNN in suse_app(...) — fails fast on mismatch
+    #   4. explicit port=NNN in rdx_app(...) — fails fast on mismatch
     if not _workloads:
         # Legacy single-workload port discovery.
         discovered_port = 8080
         for cfg in parsed_values:
-            lib = (cfg.get('suse-library', {}) or {}) if cfg else {}
+            lib = (cfg.get('rdx-library', {}) or {}) if cfg else {}
             if 'port' in lib:
                 discovered_port = lib['port']
         if port == None:
             port = discovered_port
         elif port != discovered_port:
             fail((
-                'suse_app: port=%d passed explicitly but chart/values.yaml has ' +
-                'suse-library.port=%d. The two would drift on every edit. ' +
-                'Drop the port argument from suse_app(...) — values.yaml is the ' +
-                'source of truth (see rda-docs/concepts/dsl.md). If you really ' +
+                'rdx_app: port=%d passed explicitly but chart/values.yaml has ' +
+                'rdx-library.port=%d. The two would drift on every edit. ' +
+                'Drop the port argument from rdx_app(...) — values.yaml is the ' +
+                'source of truth (see rdx-docs/concepts/dsl.md). If you really ' +
                 'need to override, change values.yaml.'
             ) % (port, discovered_port))
 
-    # Auto-discover services from `suse-library.services[]` (the unified
+    # Auto-discover services from `rdx-library.services[]` (the unified
     # DSL in bundle v0.10+). Each entry has {binding, type, provisioning}
     # and maps to (binding -> type) for the port-forward registration
     # below.
@@ -1717,7 +1717,7 @@ if __name__ == "__main__":
     # caller can register services the chart doesn't deploy itself, or
     # narrow the surface to a subset.
     #
-    # We dropped the pre-DSL legacy path (`suse-library.<chart>.enabled`
+    # We dropped the pre-DSL legacy path (`rdx-library.<chart>.enabled`
     # without `services[]`) when the bundle moved to DSL-only at v0.10.
     # If you're on a bundle <= v0.9, pin the extension to its 0.1.x line
     # or pass `services={...}` explicitly.
@@ -1727,7 +1727,7 @@ if __name__ == "__main__":
         #   - services[] entries come from chart/values.yaml (the user's
         #     DSL) — overlay never has services[].
         #   - chart-level <chart>.enabled comes from the overlay (written
-        #     by `rda render` for every enabled local service) OR from
+        #     by `rdx render` for every enabled local service) OR from
         #     chart/values.yaml on pre-0.1.38 projects that wrote it
         #     manually. Either source counts.
         #
@@ -1747,10 +1747,10 @@ if __name__ == "__main__":
         for i in range(len(parsed_values)):
             cfg = parsed_values[i]
             cfg_path = parsed_values_paths[i]
-            lib = (cfg.get('suse-library', {}) or {}) if cfg else {}
+            lib = (cfg.get('rdx-library', {}) or {}) if cfg else {}
             # Always collect lib blocks — `_chart_enabled` below needs
             # to see chart-level `<chart>.enabled` flags written into
-            # the overlay by `rda render`.
+            # the overlay by `rdx render`.
             all_lib_blocks.append(lib)
             # Services[] DSL is sourced from values.yaml ONLY. The
             # overlay re-projects it with values_mapping applied —
@@ -1787,23 +1787,23 @@ if __name__ == "__main__":
             # `shared` and `external` deploy NOTHING — registering a
             # phantom k8s_resource for them fails with "unknown
             # resource", and worse, in connect mode the host template
-            # often points at the binding secret which rda's renderer
+            # often points at the binding secret which rdx's renderer
             # surfaces as `[redacted secret <binding>-binding:host]`,
             # producing the exact symptom we're guarding against.
             if provisioning not in ('', 'local', 'deploy'):
                 continue
-            # services[].enabled drives deployment (rda-cli v0.1.38+,
+            # services[].enabled drives deployment (rdx-cli v0.1.38+,
             # bundle v0.11.6+). Default true if absent (back-compat with
             # pre-0.1.38 scaffolds; fresh scaffolds opt-in explicitly).
             # When false, the entry is inert: no binding-secret rendered,
-            # no chart-level enable flipped by rda render, no sub-chart
+            # no chart-level enable flipped by rdx render, no sub-chart
             # deployed.
             if entry.get('enabled', True) == False:
                 continue
             # Redacted-type guard: services[].type should always be a
             # plain DSL type name (e.g. 'grafana'). If it's an
             # `[redacted secret …]` marker, a bundle bug or a chained
-            # value_mapping is routing the type through rda's redactor.
+            # value_mapping is routing the type through rdx's redactor.
             # Using that string as a chart key produces resources like
             # `<release>-[redacted secret <binding>-binding:type]` —
             # bizarre, unmatchable by k8s_resource, and the Tiltfile
@@ -1812,7 +1812,7 @@ if __name__ == "__main__":
             # loudly at helm time, which is where a values-pipeline bug
             # belongs anyway).
             if type(stype) == "string" and "[redacted" in stype:
-                warn(("[suse_rda] skipping services[binding=%r]: type=%r " +
+                warn(("[rdx] skipping services[binding=%r]: type=%r " +
                       "is a redacted secret marker. The DSL type should be " +
                       "a plain string (e.g. 'grafana'). Check the bundle's " +
                       "dsl-mappings.yaml for a values_mapping that routes " +
@@ -1828,10 +1828,10 @@ if __name__ == "__main__":
             if stype:
                 services[binding] = stype
 
-    # Resolve {{.domain}} from the project's suse-library.domain value.
+    # Resolve {{.domain}} from the project's rdx-library.domain value.
     _domain_value = ''
     for _cfg in parsed_values:
-        _dl = (_cfg.get('suse-library', {}) or {}) if _cfg else {}
+        _dl = (_cfg.get('rdx-library', {}) or {}) if _cfg else {}
         if 'domain' in _dl:
             _domain_value = _dl['domain']
 
@@ -1865,8 +1865,8 @@ if __name__ == "__main__":
             out.append(link(scheme + '://' + host, host))
         return out
 
-    def _suse_lib_block(values_dict, *path):
-        block = values_dict.get('suse-library', {}) or {}
+    def _rdx_lib_block(values_dict, *path):
+        block = values_dict.get('rdx-library', {}) or {}
         for key in path:
             block = (block.get(key, {}) or {}) if hasattr(block, 'get') else {}
         return block
@@ -1877,7 +1877,7 @@ if __name__ == "__main__":
         # overlay values are included (last-wins, matches Helm stacking).
         _merged_workloads = []
         for cfg in parsed_values:
-            lib = (cfg.get('suse-library', {}) or {}) if cfg else {}
+            lib = (cfg.get('rdx-library', {}) or {}) if cfg else {}
             wls = lib.get('workloads')
             if wls:
                 _merged_workloads = wls
@@ -1910,7 +1910,7 @@ if __name__ == "__main__":
         # ─── Legacy single-workload mode ────────────────────────────────
         app_links = []
         for cfg in parsed_values:
-            app_links.extend(_ingress_links(cfg.get('suse-library', {}) or {}, domain=_domain_value))
+            app_links.extend(_ingress_links(cfg.get('rdx-library', {}) or {}, domain=_domain_value))
 
         k8s_resource(
             workload=name,
@@ -1927,12 +1927,12 @@ if __name__ == "__main__":
     # actual K8s resource name is the `service.host` template in the
     # bundle's library-chart/dsl-mappings.yaml — the same template the
     # library helper uses to build the binding-secret's `host` key.
-    # We read that file (vendored at chart_path/charts/suse-library/
+    # We read that file (vendored at chart_path/charts/rdx-library/
     # dsl-mappings.yaml after `helm dep update`), pick the chart-type's
     # entry, render the host template by substituting .Release.Name.
     # Fallback when the file is absent (older bundle) or the type isn't
     # catalogued: the legacy <release>-<service_type> assumption.
-    mappings_path = chart_path + '/charts/suse-library/dsl-mappings.yaml'
+    mappings_path = chart_path + '/charts/rdx-library/dsl-mappings.yaml'
     mappings_doc = read_yaml(mappings_path, default={'charts': {}})
     catalogued_charts = mappings_doc.get('charts', {})
 
@@ -2010,7 +2010,7 @@ if __name__ == "__main__":
           - unresolved Helm template tokens ("{{") — dsl-mappings entry
             referenced a value the Tiltfile can't substitute (e.g.
             `{{ .Values.<binding>.host }}`)
-          - rda's redacted-secret marker ("[redacted secret ...]") —
+          - rdx's redacted-secret marker ("[redacted secret ...]") —
             seen when the host template points at a binding-secret key
             in connect mode and the rendered manifest leaks the marker
             into a resource name. Registering a k8s_resource for such a
@@ -2081,7 +2081,7 @@ if __name__ == "__main__":
             "if [ -n \"$ns\" ] && ! kubectl get namespace \"$ns\" " +
             ">/dev/null 2>&1; then " +
             "kubectl delete \"$wc\" --ignore-not-found >/dev/null && " +
-            "echo \"[suse_rda] pruned stale cnpg webhook $wc " +
+            "echo \"[rdx] pruned stale cnpg webhook $wc " +
             "(target ns $ns missing)\"; " +
             "fi; " +
             "done",
@@ -2106,13 +2106,13 @@ if __name__ == "__main__":
                 "-o jsonpath='{.subsets[*].addresses[*].ip}' " +
                 "2>/dev/null || true); " +
                 "if [ -n \"$ips\" ]; then " +
-                "echo \"[suse_rda] cnpg-webhook-service endpoints " +
+                "echo \"[rdx] cnpg-webhook-service endpoints " +
                 "ready in " + namespace + ": $ips\"; " +
                 "exit 0; " +
                 "fi; " +
                 "sleep 2; " +
                 "done; " +
-                "echo \"[suse_rda] FATAL: cnpg-webhook-service has " +
+                "echo \"[rdx] FATAL: cnpg-webhook-service has " +
                 "no endpoints after 180s in ns " + namespace + "\" >&2; " +
                 "exit 1"
             ),
@@ -2126,7 +2126,7 @@ if __name__ == "__main__":
         chart_alias = aliases[binding_name]
         workload = workload_name_for(name, chart_alias, service_type)
         if _bad_workload_name(workload):
-            warn(('[suse_rda] skipping k8s_resource for binding %r ' +
+            warn(('[rdx] skipping k8s_resource for binding %r ' +
                   '(type=%r): computed workload name %r is not a valid ' +
                   'k8s resource name. This usually means dsl-mappings.yaml ' +
                   'has a host/cr_object template that references a value ' +
@@ -2156,7 +2156,7 @@ if __name__ == "__main__":
             ingress_path = ['ingress']
         svc_links = []
         for cfg in parsed_values:
-            parent = _suse_lib_block(cfg, chart_alias, *ingress_path[:-1])
+            parent = _rdx_lib_block(cfg, chart_alias, *ingress_path[:-1])
             svc_links.extend(_ingress_links(parent, ingress_path[-1], domain=_domain_value))
         is_operator_managed = False
         pod_selector = {}
@@ -2197,7 +2197,7 @@ if __name__ == "__main__":
             # via label selectors.
             cr_name = cr_object.split(':')[0]
             if _bad_workload_name(cr_name):
-                warn(('[suse_rda] skipping k8s_resource for operator CR ' +
+                warn(('[rdx] skipping k8s_resource for operator CR ' +
                       'of binding %r (type=%r): computed cr_name %r is ' +
                       'not a valid k8s resource name. The CRD entry in ' +
                       'dsl-mappings.yaml has a `cr_object` template the ' +
@@ -2250,24 +2250,24 @@ if __name__ == "__main__":
             )
 
 
-# ─── helm_rda_chart() — helm-rda plugin integration (rda-cli v0.2.0+) ──
+# ─── helm_rdx_chart() — helm-rdx plugin integration (rdx-cli v0.2.0+) ──
 #
-# Thin chart-rendering primitive that uses the helm-rda plugin's
-# `helm rda template` (DSL projection + helm template in one shell call,
+# Thin chart-rendering primitive that uses the helm-rdx plugin's
+# `helm rdx template` (DSL projection + helm template in one shell call,
 # no values.generated.yaml on disk) when available, and falls back to
-# `rda render` + Tilt's helm() builtin when not.
+# `rdx render` + Tilt's helm() builtin when not.
 #
 # Usage in a project Tiltfile:
 #
-#   load('ext://suse-rda', 'helm_rda_chart')
-#   helm_rda_chart(name='my-app', stage='dev')
+#   load('ext://rdx', 'helm_rdx_chart')
+#   helm_rdx_chart(name='my-app', stage='dev')
 #   k8s_resource('my-app', port_forwards='8080:8080')
 #
-# Unlike suse_app(), helm_rda_chart() does NOT do pack build, helm dep
+# Unlike rdx_app(), helm_rdx_chart() does NOT do pack build, helm dep
 # update, namespace creation, port-forwarding, or pull-secret mirror —
 # it's the chart-rendering step only. Compose with k8s_resource() for
 # port-forwards. For the batteries-included experience, stick with
-# suse_app(); for projects already on rda-cli v0.2.0+ that want the
+# rdx_app(); for projects already on rdx-cli v0.2.0+ that want the
 # plugin's one-step flow without the legacy machinery, this is the hook.
 
 def _check_ingress_conflicts(chart_path, values_files, namespace):
@@ -2275,7 +2275,7 @@ def _check_ingress_conflicts(chart_path, values_files, namespace):
     hosts = []
     for vfile in values_files:
         vals = read_yaml(vfile, default={})
-        sl = vals.get('suse-library', {})
+        sl = vals.get('rdx-library', {})
         domain = sl.get('domain', '')
         for svc in sl.get('services', []):
             if not svc.get('enabled', False):
@@ -2306,35 +2306,35 @@ def _check_ingress_conflicts(chart_path, values_files, namespace):
         for h in hosts:
             if h == ing_host:
                 warn(
-                    ('[suse_rda] INGRESS CONFLICT: hostname %s is already claimed ' +
+                    ('[rdx] INGRESS CONFLICT: hostname %s is already claimed ' +
                      'by namespace %s — Traefik will route to the wrong service! ' +
                      'Fix: kubectl delete ingress -n %s -l app.kubernetes.io/instance ' +
                      'or tilt down the other project first.') % (h, ing_ns, ing_ns))
 
 
-def _helm_rda_plugin_present():
-    """True iff `helm plugin list` reports a plugin named 'rda'."""
+def _helm_rdx_plugin_present():
+    """True iff `helm plugin list` reports a plugin named 'rdx'."""
     out = str(local(
-        "helm plugin list 2>/dev/null | grep -qE '^rda[[:space:]]' && " +
+        "helm plugin list 2>/dev/null | grep -qE '^rdx[[:space:]]' && " +
         "echo yes || echo no",
         quiet=True, echo_off=True,
     )).strip()
     return out == 'yes'
 
 
-def helm_rda_chart(
+def helm_rdx_chart(
         name,
         chart_path=None,
         stage=None,
         values=None,
         namespace=None,
         set=[]):
-    """Render a Helm chart with `helm rda template` and apply the result.
+    """Render a Helm chart with `helm rdx template` and apply the result.
 
-    Detects the helm-rda plugin (rda-cli v0.2.0+); when present, runs
-    `helm rda template` directly — DSL projection and `helm template`
+    Detects the helm-rdx plugin (rdx-cli v0.2.0+); when present, runs
+    `helm rdx template` directly — DSL projection and `helm template`
     happen in one shell call, no intermediate file on disk. When the
-    plugin is absent, falls back to running `rda render` and then
+    plugin is absent, falls back to running `rdx render` and then
     Tilt's helm() builtin, with a one-line warning so the dev knows to
     install the plugin for the faster path.
 
@@ -2343,9 +2343,9 @@ def helm_rda_chart(
         chart_path (str|None): path to the Helm chart relative to the
             Tiltfile. Default: auto-detected — prefers `deploy/` (bundle
             v0.11.13+ scaffolds), falls back to `chart/`.
-        stage (str|None): rda stage (e.g. 'dev', 'staging'). Passed to
-            `helm rda template --stage`. When None, the plugin uses its
-            own default (typically the project's current `.rda/stage`).
+        stage (str|None): rdx stage (e.g. 'dev', 'staging'). Passed to
+            `helm rdx template --stage`. When None, the plugin uses its
+            own default (typically the project's current `.rdx/stage`).
         values (list[str]|None): values files passed to helm (-f).
             Default [chart_path + '/values.yaml'].
         namespace (str|None): target Kubernetes namespace. Default:
@@ -2365,22 +2365,22 @@ def helm_rda_chart(
     if values == None:
         values = [chart_path + '/values.yaml']
 
-    # Stage auto-detection for the fallback path (same logic as suse_app).
+    # Stage auto-detection for the fallback path (same logic as rdx_app).
     if stage == None:
-        _fb_stage = os.getenv('RDA_STAGE', '')
+        _fb_stage = os.getenv('RDX_STAGE', '')
         if not _fb_stage:
-            _fb_stage_file = os.path.join(chart_path, '..', '.rda', 'stage')
+            _fb_stage_file = os.path.join(chart_path, '..', '.rdx', 'stage')
             if os.path.exists(_fb_stage_file):
                 _fb_stage = str(read_file(_fb_stage_file)).strip()
         if not _fb_stage:
             _fb_stage = 'dev'
         stage = _fb_stage
 
-    if _helm_rda_plugin_present():
-        # Plugin path: one shell call. `helm rda template` does the DSL
+    if _helm_rdx_plugin_present():
+        # Plugin path: one shell call. `helm rdx template` does the DSL
         # projection AND `helm template` — no values.generated.yaml on
         # disk for Tilt to garbage-collect.
-        args = ['helm', 'rda', 'template', name, chart_path]
+        args = ['helm', 'rdx', 'template', name, chart_path]
         if namespace:
             args.extend(['--namespace', namespace])
         if stage:
@@ -2392,26 +2392,26 @@ def helm_rda_chart(
         k8s_yaml(local(' '.join(args), quiet=True, echo_off=True))
         return
 
-    # Fallback: helm-rda plugin absent. Run `rda render` (writes
-    # chart/.rda/values.generated.yaml) then layer the overlay onto the
+    # Fallback: helm-rdx plugin absent. Run `rdx render` (writes
+    # chart/.rdx/values.generated.yaml) then layer the overlay onto the
     # user's values list before handing off to Tilt's helm() builtin.
-    rda_present = str(local(
-        'command -v rda > /dev/null 2>&1 && echo yes || echo no',
+    rdx_present = str(local(
+        'command -v rdx > /dev/null 2>&1 && echo yes || echo no',
         quiet=True, echo_off=True,
     )).strip()
-    if rda_present == 'yes':
-        print('helm_rda_chart: helm-rda plugin not installed; falling back ' +
-              'to `rda render` + helm template. Install the plugin for the ' +
-              'one-step flow (rda-cli v0.2.0+).')
-        local('rda render --stage %s' % stage, quiet=True, echo_off=False)
-        overlay = chart_path + '/.rda/values.generated.yaml'
+    if rdx_present == 'yes':
+        print('helm_rdx_chart: helm-rdx plugin not installed; falling back ' +
+              'to `rdx render` + helm template. Install the plugin for the ' +
+              'one-step flow (rdx-cli v0.2.0+).')
+        local('rdx render --stage %s' % stage, quiet=True, echo_off=False)
+        overlay = chart_path + '/.rdx/values.generated.yaml'
         if os.path.exists(overlay) and overlay not in values:
             values = values + [overlay]
     else:
-        print('helm_rda_chart: warning — neither the helm-rda plugin nor ' +
-              'the `rda` CLI is on PATH. The chart will render without DSL ' +
-              'projection; sub-chart values from suse-library.services[] ' +
-              'will not reach their targets. Install rda-cli v0.2.0+.')
+        print('helm_rdx_chart: warning — neither the helm-rdx plugin nor ' +
+              'the `rdx` CLI is on PATH. The chart will render without DSL ' +
+              'projection; sub-chart values from rdx-library.services[] ' +
+              'will not reach their targets. Install rdx-cli v0.2.0+.')
 
     k8s_yaml(helm(
         chart_path,

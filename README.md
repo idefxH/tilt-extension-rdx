@@ -1,25 +1,25 @@
-# tilt-extension-suse-rda
+# tilt-extension-rdx
 
-Tilt extension for SUSE Rancher Developer Access.
+Tilt extension for Rancher Developer eXperience.
 
 Wraps Cloud Native Buildpacks (via `pack`), Helm install, and service
-port-forwarding into a single declarative call (`suse_app(...)`).
+port-forwarding into a single declarative call (`rdx_app(...)`).
 
 ## Use
 
 ```python
 v1alpha1.extension_repo(
-    name='suse-rda',
-    url='https://github.com/idefxH/tilt-extension-suse-rda',
+    name='rdx',
+    url='https://github.com/idefxH/tilt-extension-rdx',
 )
 v1alpha1.extension(
-    name='suse-rda',
-    repo_name='suse-rda',
-    repo_path='suse_rda',
+    name='rdx',
+    repo_name='rdx',
+    repo_path='rdx',
 )
-load('ext://suse-rda', 'suse_app')
+load('ext://rdx', 'rdx_app')
 
-suse_app(
+rdx_app(
     name='my-app',
     language='nodejs',
 )
@@ -30,7 +30,7 @@ suse_app(
 Use `build_path` to point at a subdirectory when the source lives in a monorepo:
 
 ```python
-suse_app(
+rdx_app(
     name='my-app',
     language='go',
     build_path='services/my-app',
@@ -39,14 +39,14 @@ suse_app(
 
 ### Multi-container workloads
 
-When `suse-library.workloads[]` is present in `chart/values.yaml` (bundle v0.11+),
+When `rdx-library.workloads[]` is present in `chart/values.yaml` (bundle v0.11+),
 the extension builds each workload whose `image.tag == 'dev'`, registers a
 separate `k8s_resource` per workload, and discovers ports per-workload. The
 legacy single-workload path remains the default when `workloads[]` is absent.
 
 That replaces ~30 lines of `docker_build` / `helm` / `k8s_resource` boilerplate
-with one call. Port is auto-discovered from `suse-library.port` in values.yaml
-(default 8080). **Service port-forwards are auto-discovered from `chart/values.yaml`** — every entry under `suse-library.services[]` with `provisioning: deploy` AND a matching `<chart>.enabled: true` gets a port-forward registered. The Tiltfile stays in lockstep with `values.yaml` automatically; you don't list services in two places.
+with one call. Port is auto-discovered from `rdx-library.port` in values.yaml
+(default 8080). **Service port-forwards are auto-discovered from `chart/values.yaml`** — every entry under `rdx-library.services[]` with `provisioning: deploy` AND a matching `<chart>.enabled: true` gets a port-forward registered. The Tiltfile stays in lockstep with `values.yaml` automatically; you don't list services in two places.
 
 Entries with `provisioning: connect`, `shared`, or `external` are skipped (no in-cluster workload to forward — they bind to a pre-existing instance via the binding secret). Their operator sub-charts (e.g. `cloudnative-pg` for a connect-mode postgresql) are also dropped from `Chart.yaml` so `helm dep update` doesn't pull them. Entries whose sub-chart is not enabled are also skipped (no workload deployed).
 
@@ -64,16 +64,16 @@ Pass `services={'<binding>': '<type>'}` only when you want to register a service
 ## Repository layout
 
 ```
-tilt-extension-suse-rda/
+tilt-extension-rdx/
 ├── README.md
 ├── LICENSE
-├── suse_rda/
-│   └── Tiltfile          # the extension itself (loaded as ext://suse-rda)
+├── rdx/
+│   └── Tiltfile          # the extension itself (loaded as ext://rdx)
 └── examples/
     └── nodejs-hello/     # minimal smoke-test consuming the extension
 ```
 
-The `suse_rda/` directory name follows the Tilt convention where each
+The `rdx/` directory name follows the Tilt convention where each
 extension in a repo lives in a subdirectory named after itself.
 
 ## Supported languages
@@ -90,7 +90,7 @@ extension in a repo lives in a subdirectory named after itself.
 For existing apps with a pre-built container image (no pack build):
 
 ```python
-suse_app(
+rdx_app(
     name='my-app',
     chart_path='deploy',
     image_ref='registry.corp.com/my-app:v2.3.1',
@@ -100,7 +100,7 @@ suse_app(
 For existing Helm chart projects (no image management at all):
 
 ```python
-suse_app(
+rdx_app(
     name='my-app',
     chart_path='chart',
     helm_only=True,
@@ -110,17 +110,17 @@ suse_app(
 When `image_ref` is set, `language` is not needed. When `helm_only` is
 True, both `language` and `image_ref` are ignored.
 
-## `helm_rda_chart()` — helm-rda plugin integration (rda-cli v0.2.0+)
+## `helm_rdx_chart()` — helm-rdx plugin integration (rdx-cli v0.2.0+)
 
-Thin chart-rendering primitive that uses the `helm rda template` plugin
+Thin chart-rendering primitive that uses the `helm rdx template` plugin
 when installed (one shell call: DSL projection + `helm template` with no
 intermediate `values.generated.yaml` on disk), and falls back to
-`rda render` + Tilt's `helm()` builtin when not.
+`rdx render` + Tilt's `helm()` builtin when not.
 
 ```python
-load('ext://suse-rda', 'helm_rda_chart')
+load('ext://rdx', 'helm_rdx_chart')
 
-helm_rda_chart(
+helm_rdx_chart(
     name='my-app',
     chart_path='deploy',
     stage='dev',
@@ -128,14 +128,14 @@ helm_rda_chart(
 k8s_resource('my-app', port_forwards='8080:8080')
 ```
 
-Unlike `suse_app(...)`, this function does NOT do pack build, helm dep
+Unlike `rdx_app(...)`, this function does NOT do pack build, helm dep
 update, namespace creation, port-forwarding, or pull-secret mirror —
 it's the chart-rendering step only. Compose with `k8s_resource()` for
 port-forwards. For the batteries-included experience, stick with
-`suse_app(...)`.
+`rdx_app(...)`.
 
-Plugin detection: `helm plugin list | grep ^rda`. Missing plugin →
-fallback path with a one-line warning. Missing both plugin and `rda`
+Plugin detection: `helm plugin list | grep ^rdx`. Missing plugin →
+fallback path with a one-line warning. Missing both plugin and `rdx`
 CLI → louder warning, chart still renders without DSL projection.
 
 ## Conventional service ports
@@ -158,34 +158,34 @@ local port:
 
 | Var | Effect |
 |---|---|
-| `SUSE_RDA_DEFAULT_REGISTRY` | Calls `default_registry(...)` at extension load. Use for CI / local-mirror / air-gapped setups (e.g. `localhost:5000` for the e2e kind-mirror). |
-| `SUSE_RDA_SKIP_PULLSECRET_MIRROR=1` | Skip the `default → <ns>` mirror of `Secret/application-collection`. Set when an operator (kubernetes-reflector, External Secrets) distributes the pull secret instead. |
+| `RDX_DEFAULT_REGISTRY` | Calls `default_registry(...)` at extension load. Use for CI / local-mirror / air-gapped setups (e.g. `localhost:5000` for the e2e kind-mirror). |
+| `RDX_SKIP_PULLSECRET_MIRROR=1` | Skip the `default → <ns>` mirror of `Secret/application-collection`. Set when an operator (kubernetes-reflector, External Secrets) distributes the pull secret instead. |
 
 ## SUSE-AppCo buildpacks (future)
 
 When the SUSE-AppCo buildpacks land, override the builder:
 
 ```python
-suse_app(..., builder_image='registry.suse.com/rda/builder:latest')
+rdx_app(..., builder_image='registry.suse.com/rda/builder:latest')
 ```
 
 ## Where image-level gates fit (forward-looking)
 
-`suse_app(...)` is the right hook for **image-level gates** — checks
+`rdx_app(...)` is the right hook for **image-level gates** — checks
 that run at `pack build` time, before Tilt deploys anything to the
-cluster. These are Layer 1 of RDA's four-layer defense model. The
-canonical reference is [`rda-docs/concepts/gates.md`](https://github.com/idefxH/rda-docs/blob/main/concepts/gates.md);
-the anchor in the rda CLI spec is the `BEHAVIOR: promote` NOTES in
-[`rda-cli/rda.md`](https://github.com/idefxH/rda-cli/blob/main/rda.md)
+cluster. These are Layer 1 of RDX's four-layer defense model. The
+canonical reference is [`rdx-docs/concepts/gates.md`](https://github.com/idefxH/rdx-docs/blob/main/concepts/gates.md);
+the anchor in the rdx CLI spec is the `BEHAVIOR: promote` NOTES in
+[`rdx-cli/rdx.md`](https://github.com/idefxH/rdx-cli/blob/main/rdx.md)
 under "Layered-defense model".
 
 The four layers, scoped to what each can see:
 
 | Layer | When | Scope | Owner |
 |---|---|---|---|
-| 1. image-time | `pack build` | the app image | this extension (`suse_app`) + buildpack stack |
-| 2. template-time | every `helm template` | rendered DSL | `rda-opinion-bundle-example` library helpers |
-| 3. promote-time | `rda promote` | declared chart deps + rendered manifests | `rda` CLI |
+| 1. image-time | `pack build` | the app image | this extension (`rdx_app`) + buildpack stack |
+| 2. template-time | every `helm template` | rendered DSL | `rdx-bundle` library helpers |
+| 3. promote-time | `rdx promote` | declared chart deps + rendered manifests | `rdx` CLI |
 | 4. admission-time | cluster admission | live applies | cluster operator's Kubewarden policies |
 
 Each layer catches what only it can see; later layers exist as
@@ -211,8 +211,8 @@ Scoped to the app image only:
 
 ### Status
 
-Spec-only today: `suse_app(...)` does not yet take gate-related
-flags. Tracking issue: idefxH/tilt-extension-suse-rda#1 (to be
+Spec-only today: `rdx_app(...)` does not yet take gate-related
+flags. Tracking issue: idefxH/tilt-extension-rdx#1 (to be
 filed). The promote-time and template-time layers are already
 shipping; this layer comes online when the SUSE-AppCo buildpacks
 do, since the corp-curated image gates need a corp-curated builder

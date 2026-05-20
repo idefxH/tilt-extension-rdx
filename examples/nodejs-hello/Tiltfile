@@ -1,11 +1,11 @@
-# Local dev: include the extension directly so changes to ../../suse_rda/Tiltfile
+# Local dev: include the extension directly so changes to ../../rdx/Tiltfile
 # are picked up without going through Tilt's repo-fetch cache.
-include('../../suse_rda/Tiltfile')
+include('../../rdx/Tiltfile')
 
-suse_app(
+rdx_app(
     name='hello',
     language='nodejs',
     port=8080,
     # services= defaults to None → auto-discovered from chart/values.yaml
-    # (suse-library.services[] DSL + legacy <chart>.enabled).
+    # (rdx-library.services[] DSL + legacy <chart>.enabled).
 )

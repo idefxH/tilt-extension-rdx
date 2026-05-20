@@ -1,6 +1,6 @@
 apiVersion: v2
 name: hello
-description: Minimal example consumed by tilt-extension-suse-rda
+description: Minimal example consumed by tilt-extension-rdx
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
