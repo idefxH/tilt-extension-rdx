@@ -247,7 +247,7 @@ def rdx_app(
     Override:
         builder_image (str): CNB builder image. Default Paketo full builder.
             Override when RDX-AppCo buildpacks ship:
-            builder_image='registry.rdx.io/builder:latest'.
+            builder_image='registry.rdx.suse.com/builder:latest'.
         extra_buildpacks (list[str]): additional CNB buildpacks appended to
             the language defaults. Useful for the future RDX OTel buildpack
             or a service-binding buildpack.
@@ -386,7 +386,7 @@ def rdx_app(
     # (kubernetes-reflector / External Secrets / GitOps / manual):
     #
     #   1. Env var RDX_SKIP_PULLSECRET_MIRROR=1 (cluster-wide).
-    #   2. Namespace label rdx.io/pullsecret-managed-by=operator
+    #   2. Namespace label rdx.suse.com/pullsecret-managed-by=operator
     #      — set this on a project NS to declare "an operator owns the
     #      pullsecret here, hands off". Per-NS, persistent in YAML.
     #   3. Source-side annotation: if Secret/application-collection in
@@ -409,7 +409,7 @@ def rdx_app(
             "jsonpath='{.metadata.labels.rdx\\.io/pullsecret-managed-by}' " +
             "2>/dev/null)\" = 'operator' ]; then " +
             "echo '[rdx] skipping pullsecret mirror " +
-            "(ns " + namespace + " labelled rdx.io/pullsecret-managed-by=operator)'; " +
+            "(ns " + namespace + " labelled rdx.suse.com/pullsecret-managed-by=operator)'; " +
             "exit 0; fi; " +
             # Step 0c: source Secret is operator-managed (ESO / reflector).
             # Don't fight the operator — step back and let its controller

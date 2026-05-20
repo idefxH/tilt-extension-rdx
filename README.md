@@ -166,7 +166,7 @@ local port:
 When the RDX-AppCo buildpacks land, override the builder:
 
 ```python
-rdx_app(..., builder_image='registry.rdx.io/builder:latest')
+rdx_app(..., builder_image='registry.rdx.suse.com/builder:latest')
 ```
 
 ## Where image-level gates fit (forward-looking)
