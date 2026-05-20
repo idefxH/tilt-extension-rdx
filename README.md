@@ -1,6 +1,6 @@
 # tilt-extension-rdx
 
-Tilt extension for Rancher Developer eXperience.
+Tilt extension for RDX (Rancher Developer eXperience).
 
 Wraps Cloud Native Buildpacks (via `pack`), Helm install, and service
 port-forwarding into a single declarative call (`rdx_app(...)`).
@@ -161,12 +161,12 @@ local port:
 | `RDX_DEFAULT_REGISTRY` | Calls `default_registry(...)` at extension load. Use for CI / local-mirror / air-gapped setups (e.g. `localhost:5000` for the e2e kind-mirror). |
 | `RDX_SKIP_PULLSECRET_MIRROR=1` | Skip the `default → <ns>` mirror of `Secret/application-collection`. Set when an operator (kubernetes-reflector, External Secrets) distributes the pull secret instead. |
 
-## SUSE-AppCo buildpacks (future)
+## RDX-AppCo buildpacks (future)
 
-When the SUSE-AppCo buildpacks land, override the builder:
+When the RDX-AppCo buildpacks land, override the builder:
 
 ```python
-rdx_app(..., builder_image='registry.suse.com/rda/builder:latest')
+rdx_app(..., builder_image='registry.rdx.io/builder:latest')
 ```
 
 ## Where image-level gates fit (forward-looking)
@@ -184,7 +184,7 @@ The four layers, scoped to what each can see:
 | Layer | When | Scope | Owner |
 |---|---|---|---|
 | 1. image-time | `pack build` | the app image | this extension (`rdx_app`) + buildpack stack |
-| 2. template-time | every `helm template` | rendered DSL | `rdx-bundle` library helpers |
+| 2. template-time | every `helm template` | rendered DSL | `rdx-opinion-bundle-example` library helpers |
 | 3. promote-time | `rdx promote` | declared chart deps + rendered manifests | `rdx` CLI |
 | 4. admission-time | cluster admission | live applies | cluster operator's Kubewarden policies |
 
@@ -214,7 +214,7 @@ Scoped to the app image only:
 Spec-only today: `rdx_app(...)` does not yet take gate-related
 flags. Tracking issue: idefxH/tilt-extension-rdx#1 (to be
 filed). The promote-time and template-time layers are already
-shipping; this layer comes online when the SUSE-AppCo buildpacks
+shipping; this layer comes online when the RDX-AppCo buildpacks
 do, since the corp-curated image gates need a corp-curated builder
 to run inside.
 

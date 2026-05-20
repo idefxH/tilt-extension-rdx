@@ -2,7 +2,7 @@
 #
 # Wraps Cloud Native Buildpacks (via `pack`), Helm install, and service
 # port-forwarding into a single declarative call. Designed for projects
-# scaffolded by `rdx new` from a Rancher Developer eXperience opinion
+# scaffolded by `rdx new` from an RDX opinion
 # bundle, but usable from any Tiltfile that wants the same conventions.
 #
 # Usage in a project's Tiltfile:
@@ -21,7 +21,7 @@
 # add-service`) is registered. The app's HTTP port is read from
 # `rdx-library.port` in the same values.yaml — values.yaml is the source
 # of truth, so the Tiltfile stays terse. Override builder_image when
-# SUSE-AppCo buildpacks ship.
+# RDX-AppCo buildpacks ship.
 #
 # Pass `services={'<binding>': '<type>'}` explicitly only when you want to
 # register a service the chart doesn't deploy itself, or narrow the
@@ -117,7 +117,7 @@ LANGUAGE_DEFAULTS = {
         # cache keeps rebuilds to ~10-15s after the first one.
         #
         # If a future builder ships Go in the launch image (e.g.
-        # SUSE AppCo builder with a `-dev` variant), re-enable
+        # RDX-AppCo builder with a `-dev` variant), re-enable
         # live_update_paths and switch dev: to air.
         'buildpacks': ['heroku/go', 'heroku/procfile'],
         'live_update_paths': [],
@@ -246,10 +246,10 @@ def rdx_app(
 
     Override:
         builder_image (str): CNB builder image. Default Paketo full builder.
-            Override when SUSE-AppCo buildpacks ship:
-            builder_image='registry.suse.com/rda/builder:latest'.
+            Override when RDX-AppCo buildpacks ship:
+            builder_image='registry.rdx.io/builder:latest'.
         extra_buildpacks (list[str]): additional CNB buildpacks appended to
-            the language defaults. Useful for the future SUSE OTel buildpack
+            the language defaults. Useful for the future RDX OTel buildpack
             or a service-binding buildpack.
         additional_env (dict): build-time env vars passed via `pack build --env`.
             E.g. {'BP_NODE_VERSION': '22'}.
@@ -591,7 +591,7 @@ def rdx_app(
     # files, applies the resulting manifests to the cluster.
     #
     # Run `helm dependency update` recursively. The parent chart vendors
-    # the library chart at charts/rdx-library/, and the library chart
+    # the RDX library chart at charts/rdx-library/, and the library chart
     # itself declares oci:// dependencies on AppCo charts (e.g. postgresql).
     # `helm dep update` is non-recursive — it only pulls deps for the path
     # you pass. We walk charts/*/Chart.yaml first, update each, then update
@@ -1559,7 +1559,7 @@ if __name__ == "__main__":
     # happen out of band — `rdx render` does it pre-helm. We call it here,
     # right before `helm(...)`, so chart/values.generated.yaml is fresh
     # for every tilt up. Spec: idefxH/rdx-cli/rdx.md BEHAVIOR: render.
-    # Closes idefxH/rdx-bundle#66.
+    # Closes idefxH/rdx-opinion-bundle-example#66.
     #
     # Wiring choices:
     #   - We call `rdx render` (NOT --check) at every tilt up. Generating
