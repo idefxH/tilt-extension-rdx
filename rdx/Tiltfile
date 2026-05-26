@@ -2028,96 +2028,142 @@ if __name__ == "__main__":
             return True
         return False
 
-    # ─── CNPG webhook lifecycle ─────────────────────────────────────────
-    # The cloudnative-pg sub-chart installs cluster-scoped
-    # Mutating/ValidatingWebhookConfiguration objects that need two
-    # special-case bits the rest of the catalog doesn't.
+    # ─── Operator admission-webhook lifecycle hooks ─────────────────────
+    # Catalog-driven webhook lifecycle for any chart that bundles an
+    # operator with cluster-scoped Mutating/ValidatingWebhookConfiguration
+    # objects. Two failure modes the catalog metadata defends against:
     #
     # (B1) Stale-webhook prune — `tilt down` does NOT reliably remove
-    # cluster-scoped webhook configs whose names are helm-templated
-    # off the release. A leftover config from a prior scenario has
-    # `clientConfig.service.namespace` pointing at a now-deleted
-    # namespace; the kube-apiserver then blocks every CNPG admission
-    # in the new scenario with `no endpoints available for service
-    # "cnpg-webhook-service"`. We prune any configs whose target
-    # namespace no longer exists, BEFORE Tilt applies the new helm
-    # output. Label-scoped to `app.kubernetes.io/name=cloudnative-pg`
-    # so we don't touch unrelated webhook configs.
+    # cluster-scoped webhook configs whose names are helm-templated off
+    # the release. A leftover config from a prior scenario points its
+    # `clientConfig.service.namespace` at a now-deleted namespace; the
+    # apiserver then blocks every admission in the new scenario with
+    # `no endpoints available for service "<svc>"`. We prune any configs
+    # whose target namespace no longer exists BEFORE Tilt applies the new
+    # helm output. Label-scoped via `webhook_app_label` so we don't touch
+    # unrelated configs.
     #
-    # (B2) Endpoint-ready gate — on a cold cluster the operator pod
-    # image pull can run >5s. The Cluster CR is rendered in the same
-    # helm stream as the operator Deployment + webhook configs, and
-    # the apiserver tries to validate the CR via the webhook the
-    # moment kubectl apply lands. With no operator pod yet, validation
-    # fails. We register a local_resource that waits for the operator's
-    # webhook Service to have at least one Endpoints address, and
-    # add it to the Cluster CR's resource_deps below.
-    _has_cnpg = False
-    _cnpg_operator_resource = ''
+    # (B2) Endpoint-ready gate — on a cold cluster the operator pod image
+    # pull can run >5s. The operator's CR is rendered in the same helm
+    # stream as the operator Deployment + webhook configs; the apiserver
+    # tries to validate the CR via the webhook the moment kubectl apply
+    # lands. With no operator pod yet, validation fails. We register a
+    # local_resource that waits for the operator's webhook Service to have
+    # at least one Endpoints address, and add it to the CR's resource_deps.
+    #
+    # An operator entry in dsl-mappings.yaml opts in by setting
+    # `operator_managed: true` AND declaring `webhook_service_name`.
+    # Optional: `webhook_namespace` (default: release namespace),
+    # `webhook_app_label` (selector value for the prune scan, default
+    # from _OPERATOR_DEFAULTS table below).
+    #
+    # _OPERATOR_DEFAULTS lets older bundles (whose catalog doesn't yet
+    # declare webhook_* fields) keep the same hook behavior. New operators
+    # should declare these in their dsl-mappings entry instead of adding
+    # to this table.
+    _OPERATOR_DEFAULTS = {
+        'cnpg': {
+            'webhook_service_name': 'cnpg-webhook-service',
+            'webhook_app_label': 'cloudnative-pg',
+        },
+    }
+    _op_hooks = []
+    _op_seen_types = {}
     for _binding, _stype in services.items():
-        if _stype == 'cnpg':
-            _has_cnpg = True
-            _ce = catalogued_charts.get(_stype, {})
-            _cvs = _ce.get('versions', [])
-            if _cvs:
-                _op_tpl = _cvs[0].get('operator_resource', '')
-                if _op_tpl:
-                    _cnpg_operator_resource = (_op_tpl
-                        .replace('{{ .Release.Name }}', name)
-                        .replace('{{.Release.Name}}', name))
-            break
-    _cnpg_webhook_ready_resource = ''
-    if _has_cnpg:
-        # (B1) Prune orphaned webhook configs synchronously.
-        local(
-            "set -e; " +
-            "for wc in " +
-            "$(kubectl get mutatingwebhookconfigurations.admissionregistration.k8s.io " +
-            "-l app.kubernetes.io/name=cloudnative-pg -o name 2>/dev/null) " +
-            "$(kubectl get validatingwebhookconfigurations.admissionregistration.k8s.io " +
-            "-l app.kubernetes.io/name=cloudnative-pg -o name 2>/dev/null); do " +
-            "ns=$(kubectl get \"$wc\" -o " +
-            "jsonpath='{.webhooks[0].clientConfig.service.namespace}' 2>/dev/null); " +
-            "if [ -n \"$ns\" ] && ! kubectl get namespace \"$ns\" " +
-            ">/dev/null 2>&1; then " +
-            "kubectl delete \"$wc\" --ignore-not-found >/dev/null && " +
-            "echo \"[rdx] pruned stale cnpg webhook $wc " +
-            "(target ns $ns missing)\"; " +
-            "fi; " +
-            "done",
-            quiet=False, echo_off=True)
+        if _stype in _op_seen_types:
+            continue
+        _ce = catalogued_charts.get(_stype, {})
+        _cvs = _ce.get('versions', [])
+        if not _cvs:
+            continue
+        _ver = _cvs[0]
+        if not _ver.get('operator_managed'):
+            continue
+        _defaults = _OPERATOR_DEFAULTS.get(_stype, {})
+        _wh_svc = _ver.get('webhook_service_name',
+                           _defaults.get('webhook_service_name', ''))
+        if not _wh_svc:
+            continue
+        _op_seen_types[_stype] = True
+        _wh_ns = _ver.get('webhook_namespace', '') or namespace
+        _wh_label = _ver.get('webhook_app_label',
+                             _defaults.get('webhook_app_label', ''))
+        _op_res = ''
+        _op_tpl = _ver.get('operator_resource', '')
+        if _op_tpl:
+            _op_res = (_op_tpl
+                .replace('{{ .Release.Name }}', name)
+                .replace('{{.Release.Name}}', name))
+        _op_hooks.append({
+            'service_type': _stype,
+            'webhook_service_name': _wh_svc,
+            'webhook_namespace': _wh_ns,
+            'webhook_app_label': _wh_label,
+            'operator_resource': _op_res,
+            'ready_resource': name + '-' + _stype + '-webhook-ready',
+        })
+
+    # service_type → ready_resource name. Consumed in the CR-registration
+    # loop below to attach the gate to the CR's resource_deps.
+    _op_ready_by_type = {}
+    for _h in _op_hooks:
+        _op_ready_by_type[_h['service_type']] = _h['ready_resource']
+
+    for _hook in _op_hooks:
+        # (B1) Prune orphaned webhook configs scoped by app label.
+        # Skip when no label is configured: a label-less kubectl get
+        # would return EVERY cluster-scoped webhook config — far too
+        # broad to safely mass-prune.
+        if _hook['webhook_app_label']:
+            _sel = 'app.kubernetes.io/name=' + _hook['webhook_app_label']
+            local(
+                "set -e; " +
+                "for wc in " +
+                "$(kubectl get mutatingwebhookconfigurations.admissionregistration.k8s.io " +
+                "-l " + _sel + " -o name 2>/dev/null) " +
+                "$(kubectl get validatingwebhookconfigurations.admissionregistration.k8s.io " +
+                "-l " + _sel + " -o name 2>/dev/null); do " +
+                "ns=$(kubectl get \"$wc\" -o " +
+                "jsonpath='{.webhooks[0].clientConfig.service.namespace}' 2>/dev/null); " +
+                "if [ -n \"$ns\" ] && ! kubectl get namespace \"$ns\" " +
+                ">/dev/null 2>&1; then " +
+                "kubectl delete \"$wc\" --ignore-not-found >/dev/null && " +
+                "echo \"[rdx] pruned stale " + _hook['service_type'] +
+                " webhook $wc (target ns $ns missing)\"; " +
+                "fi; " +
+                "done",
+                quiet=False, echo_off=True)
 
         # (B2) Endpoint-ready gate. Polls every 2s for up to 180s.
-        # `resource_deps` on the operator Deployment makes Tilt run
-        # this only after the operator pod is past Pending. The
-        # Cluster CR's k8s_resource (below) deps on this resource,
-        # which gates the kubectl apply of the CR.
-        _cnpg_webhook_ready_resource = name + '-cnpg-webhook-ready'
+        # `resource_deps` on the operator Deployment makes Tilt run this
+        # only after the operator pod is past Pending. The CR's
+        # k8s_resource (below) deps on this resource, which gates the
+        # kubectl apply of the CR.
         _wait_deps = []
-        if _cnpg_operator_resource:
-            _wait_deps = [_cnpg_operator_resource]
+        if _hook['operator_resource']:
+            _wait_deps = [_hook['operator_resource']]
         local_resource(
-            _cnpg_webhook_ready_resource,
+            _hook['ready_resource'],
             cmd=(
                 "set -e; " +
                 "for i in $(seq 1 90); do " +
-                "ips=$(kubectl get endpoints cnpg-webhook-service " +
-                "-n " + namespace + " " +
+                "ips=$(kubectl get endpoints " + _hook['webhook_service_name'] + " " +
+                "-n " + _hook['webhook_namespace'] + " " +
                 "-o jsonpath='{.subsets[*].addresses[*].ip}' " +
                 "2>/dev/null || true); " +
                 "if [ -n \"$ips\" ]; then " +
-                "echo \"[rdx] cnpg-webhook-service endpoints " +
-                "ready in " + namespace + ": $ips\"; " +
+                "echo \"[rdx] " + _hook['webhook_service_name'] +
+                " endpoints ready in " + _hook['webhook_namespace'] + ": $ips\"; " +
                 "exit 0; " +
                 "fi; " +
                 "sleep 2; " +
                 "done; " +
-                "echo \"[rdx] FATAL: cnpg-webhook-service has " +
-                "no endpoints after 180s in ns " + namespace + "\" >&2; " +
+                "echo \"[rdx] FATAL: " + _hook['webhook_service_name'] +
+                " has no endpoints after 180s in ns " + _hook['webhook_namespace'] + "\" >&2; " +
                 "exit 1"
             ),
             resource_deps=_wait_deps,
-            labels=['cnpg'],
+            labels=[_hook['service_type']],
             allow_parallel=True,
         )
 
@@ -2214,10 +2260,13 @@ if __name__ == "__main__":
             _cr_deps = []
             if operator_resource:
                 _cr_deps.append(operator_resource)
-            # CNPG: also wait for the operator's webhook service to have
-            # endpoints before applying the Cluster CR (see B2 above).
-            if service_type == 'cnpg' and _cnpg_webhook_ready_resource:
-                _cr_deps.append(_cnpg_webhook_ready_resource)
+            # Operator-managed services that ship admission webhooks
+            # (catalog opts in via `webhook_service_name`): wait for the
+            # operator's webhook Service to have endpoints before applying
+            # the CR. See the (B2) gate registered above.
+            _wh_ready = _op_ready_by_type.get(service_type, '')
+            if _wh_ready:
+                _cr_deps.append(_wh_ready)
             if _cr_deps:
                 resource_kwargs['resource_deps'] = _cr_deps
             if svc_port:

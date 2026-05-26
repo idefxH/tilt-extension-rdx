@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Changed
+
+- **Operator webhook hooks are now catalog-driven.** The CNPG-specific
+  webhook-prune and endpoint-ready-gate logic in `rdx_app()` is now a
+  generic mechanism keyed off three (optional) `dsl-mappings.yaml` fields
+  on any `operator_managed: true` version entry: `webhook_service_name`,
+  `webhook_namespace` (default: release namespace), and
+  `webhook_app_label` (label-selector value for the prune scan). A small
+  `_OPERATOR_DEFAULTS` table in the Tiltfile supplies the same values
+  for `cnpg` so older bundles whose catalog doesn't declare these fields
+  yet behave identically. The readiness-gate resource is now named
+  `<release>-<service_type>-webhook-ready` (was `<release>-cnpg-webhook-ready`
+  — unchanged for cnpg). Any future operator-managed chart can opt in
+  by adding the three fields to its catalog entry.
+
 ### Fixed
 
 - **CNPG: prune stale cluster-scoped webhook configs at tilt up.** `tilt down`
