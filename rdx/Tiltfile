@@ -198,7 +198,8 @@ def rdx_app(
             chart's metadata.name (so the Deployment resource name matches).
         language (str|None): one of 'nodejs', 'python', 'java', 'go'. Drives
             the default buildpacks and live-update behaviour. Optional when
-            image_ref or helm_only is set.
+            image_ref or helm_only is set; an empty / None value also
+            implies helm_only mode (chart-only deploy, no pack build).
 
     Common:
         port (int|None): HTTP port exposed by the app container. **Default
@@ -259,7 +260,9 @@ def rdx_app(
             map the app to 'app', services to 'services'.
     """
     if not helm_only and not image_ref:
-        if language not in LANGUAGE_DEFAULTS:
+        if not language:
+            helm_only = True
+        elif language not in LANGUAGE_DEFAULTS:
             fail('rdx_app: unsupported language %r. Supported: %s' % (
                 language, ', '.join(sorted(LANGUAGE_DEFAULTS.keys()))))
 
