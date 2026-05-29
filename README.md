@@ -161,9 +161,9 @@ local port:
 | `RDX_DEFAULT_REGISTRY` | Calls `default_registry(...)` at extension load. Use for CI / local-mirror / air-gapped setups (e.g. `localhost:5000` for the e2e kind-mirror). |
 | `RDX_SKIP_PULLSECRET_MIRROR=1` | Skip the `default → <ns>` mirror of `Secret/application-collection`. Set when an operator (kubernetes-reflector, External Secrets) distributes the pull secret instead. |
 
-## RDX-AppCo buildpacks (future)
+## RDX-SUSE buildpacks (future)
 
-When the RDX-AppCo buildpacks land, override the builder:
+When the RDX-SUSE buildpacks land, override the builder:
 
 ```python
 rdx_app(..., builder_image='registry.rdx.suse.com/builder:latest')
@@ -202,7 +202,7 @@ Scoped to the app image only:
   configurable via the corp overlay.
 - **Image signature** — verify (or produce) a cosign signature
   against the corp KMS key. Pairs with Layer 3's `cosign_verify`
-  for AppCo sub-chart images.
+  for SUSE sub-chart images.
 - **SBOM emission** — paketo already produces SBOMs; the extension
   surfaces them as a Tilt artefact and stages them for the
   promotion record.
@@ -214,7 +214,7 @@ Scoped to the app image only:
 Spec-only today: `rdx_app(...)` does not yet take gate-related
 flags. Tracking issue: idefxH/tilt-extension-rdx#1 (to be
 filed). The promote-time and template-time layers are already
-shipping; this layer comes online when the RDX-AppCo buildpacks
+shipping; this layer comes online when the RDX-SUSE buildpacks
 do, since the corp-curated image gates need a corp-curated builder
 to run inside.
 

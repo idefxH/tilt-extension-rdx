@@ -3,7 +3,7 @@
 Align vendored sub-chart Chart.yaml versions with the parent's dep
 declarations.
 
-AppCo (and possibly other) Helm charts publish OCI artifact tags that
+SUSE (and possibly other) Helm charts publish OCI artifact tags that
 don't match the chart's internal Chart.yaml version (e.g. tag
 "0.4.4-29.1", chart version "0.4.4"). Helm's dep-matching at template
 time uses the chart's INTERNAL version, so the alias the parent

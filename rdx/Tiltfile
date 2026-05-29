@@ -21,7 +21,7 @@
 # add-service`) is registered. The app's HTTP port is read from
 # `rdx-library.port` in the same values.yaml — values.yaml is the source
 # of truth, so the Tiltfile stays terse. Override builder_image when
-# RDX-AppCo buildpacks ship.
+# RDX-SUSE buildpacks ship.
 #
 # Pass `services={'<binding>': '<type>'}` explicitly only when you want to
 # register a service the chart doesn't deploy itself, or narrow the
@@ -58,8 +58,8 @@ allow_k8s_contexts(k8s_context())
 # handler resolution is unreliable for nested execve in pack's
 # ephemeral-lifecycle container. Reproduces with every Paketo tag we
 # tested (jammy-base, jammy-full, all versions). Net: not actionable on
-# our side until Paketo or AppCo publishes an arm64 builder. Tracked in
-# tilt-extension-rdx#1 for the AppCo migration.
+# our side until Paketo or SUSE publishes an arm64 builder. Tracked in
+# tilt-extension-rdx#1 for the SUSE migration.
 #
 # Heroku 24 series: builder ~400MB (vs Paketo full 1.5GB), ships
 # heroku/nodejs (active, v5.5.8 on 2026-04-16), heroku/python,
@@ -117,7 +117,7 @@ LANGUAGE_DEFAULTS = {
         # cache keeps rebuilds to ~10-15s after the first one.
         #
         # If a future builder ships Go in the launch image (e.g.
-        # RDX-AppCo builder with a `-dev` variant), re-enable
+        # RDX-SUSE builder with a `-dev` variant), re-enable
         # live_update_paths and switch dev: to air.
         'buildpacks': ['heroku/go', 'heroku/procfile'],
         'live_update_paths': [],
@@ -144,7 +144,7 @@ if _rdx_default_registry:
 #
 # The rdx library-chart writes Service-Binding-Spec-compliant Secrets
 # whose stringData contains the chart `type` (`postgresql`, `prometheus`,
-# `grafana`, `dex`, ...) and `provider` (`rdx-appco`). The SBS REQUIRES
+# `grafana`, `dex`, ...) and `provider` (`rdx-suse`). The SBS REQUIRES
 # `type` to live in the Secret data — that's not optional. Tilt then
 # harvests every Secret value it deploys and substitutes the literal
 # strings everywhere in its log/UI output, so a workload named
@@ -198,7 +198,8 @@ def rdx_app(
             chart's metadata.name (so the Deployment resource name matches).
         language (str|None): one of 'nodejs', 'python', 'java', 'go'. Drives
             the default buildpacks and live-update behaviour. Optional when
-            image_ref or helm_only is set.
+            image_ref or helm_only is set; an empty / None value also
+            implies helm_only mode (chart-only deploy, no pack build).
 
     Common:
         port (int|None): HTTP port exposed by the app container. **Default
@@ -246,7 +247,7 @@ def rdx_app(
 
     Override:
         builder_image (str): CNB builder image. Default Paketo full builder.
-            Override when RDX-AppCo buildpacks ship:
+            Override when RDX-SUSE buildpacks ship:
             builder_image='registry.rdx.suse.com/builder:latest'.
         extra_buildpacks (list[str]): additional CNB buildpacks appended to
             the language defaults. Useful for the future RDX OTel buildpack
@@ -259,7 +260,9 @@ def rdx_app(
             map the app to 'app', services to 'services'.
     """
     if not helm_only and not image_ref:
-        if language not in LANGUAGE_DEFAULTS:
+        if not language:
+            helm_only = True
+        elif language not in LANGUAGE_DEFAULTS:
             fail('rdx_app: unsupported language %r. Supported: %s' % (
                 language, ', '.join(sorted(LANGUAGE_DEFAULTS.keys()))))
 
@@ -370,7 +373,7 @@ def rdx_app(
     #   - The pod's spec carries `imagePullSecrets: [application-collection]`
     #     unconditionally. Without the Secret in NS, kubelet logs
     #     `Unable to retrieve some image pull secrets`. App image pulls
-    #     from dp.apps.rancher.io (BCI base, AppCo subchart images) all
+    #     from dp.apps.rancher.io (BCI base, SUSE subchart images) all
     #     fail with ImagePullBackOff — locally Tilt can mask this by
     #     building images itself, but any real subchart pull cracks open.
     #
@@ -380,7 +383,7 @@ def rdx_app(
     #      Strips namespace + cluster-bound metadata so apply lands in
     #      the new ns. Idempotent (apply, not create).
     #   3. Else loud failure with the remediation hint pointing at
-    #      `helm registry login` + the AppCo extension docs.
+    #      `helm registry login` + the SUSE extension docs.
     #
     # Three escape hatches to coexist with operator-managed distribution
     # (kubernetes-reflector / External Secrets / GitOps / manual):
@@ -430,8 +433,8 @@ def rdx_app(
             "if ! kubectl get secret -n default application-collection " +
             ">/dev/null 2>&1; then " +
             "echo '[rdx] FATAL: Secret/application-collection not found " +
-            "in `default` (the AppCo Rancher Desktop extension would normally " +
-            "install it there). Either install/launch the AppCo extension, " +
+            "in `default` (the SUSE Rancher Desktop extension would normally " +
+            "install it there). Either install/launch the SUSE extension, " +
             "OR run `helm registry login dp.apps.rancher.io` then bootstrap " +
             "the Secret manually via kubectl create secret docker-registry; " +
             "OR set RDX_SKIP_PULLSECRET_MIRROR=1 if your cluster uses " +
@@ -592,13 +595,13 @@ def rdx_app(
     #
     # Run `helm dependency update` recursively. The parent chart vendors
     # the RDX library chart at charts/rdx-library/, and the library chart
-    # itself declares oci:// dependencies on AppCo charts (e.g. postgresql).
+    # itself declares oci:// dependencies on SUSE charts (e.g. postgresql).
     # `helm dep update` is non-recursive — it only pulls deps for the path
     # you pass. We walk charts/*/Chart.yaml first, update each, then update
-    # the parent. Without this step the AppCo sub-charts never land in
+    # the parent. Without this step the SUSE sub-charts never land in
     # charts/rdx-library/charts/ and their resources never get rendered.
     # Requires `helm registry login dp.apps.rancher.io` (one-time, typically
-    # wired by the AppCo Rancher Desktop extension).
+    # wired by the SUSE Rancher Desktop extension).
     # Strategy: only run helm dep update INSIDE vendored sub-chart directories.
     # We skip 'helm dep update' on the parent because:
     #   1. The bundle vendors sub-charts as directories under charts/*. helm
@@ -618,7 +621,7 @@ def rdx_app(
 Align vendored sub-chart Chart.yaml versions with the parent's dep
 declarations.
 
-AppCo (and possibly other) Helm charts publish OCI artifact tags that
+SUSE (and possibly other) Helm charts publish OCI artifact tags that
 don't match the chart's internal Chart.yaml version (e.g. tag
 "0.4.4-29.1", chart version "0.4.4"). Helm's dep-matching at template
 time uses the chart's INTERNAL version, so the alias the parent
@@ -733,9 +736,9 @@ if __name__ == "__main__":
 
     # Filter the library chart's deps down to ONLY the sub-charts the
     # project has enabled. Without this, every `helm dep update` pulls
-    # all 7+ AppCo charts (postgresql, redis, prometheus, grafana, dex,
+    # all 7+ SUSE charts (postgresql, redis, prometheus, grafana, dex,
     # mariadb, apache-kafka, ...) on every fresh project — even when
-    # the dev only enabled mariadb. Triggers AppCo rate-limits in
+    # the dev only enabled mariadb. Triggers SUSE rate-limits in
     # high-iteration workflows (e2e harness, repeated `rdx new`).
     #
     # The filter reads the project's values + the rdx-render overlay,
@@ -753,7 +756,7 @@ if __name__ == "__main__":
 Strip the library Chart.yaml deps down to only the sub-charts the
 project has enabled in its values. Cuts `helm dep update` work to
 the minimum (one OCI pull per actually-used sub-chart) and dodges
-AppCo rate-limits.
+SUSE rate-limits.
 
 Usage: filter_enabled_deps.py <library-chart-dir> <values-file>...
 
@@ -1466,7 +1469,7 @@ if __name__ == "__main__":
         '    [ -f "$sub/Chart.yaml" ] || continue; ' +
         '    grep -q "^dependencies:" "$sub/Chart.yaml" || continue; ' +
         # Filter the library's deps down to only what's enabled in the
-        # project's values. Cuts AppCo OCI pulls from N (every catalog
+        # project's values. Cuts SUSE OCI pulls from N (every catalog
         # chart) to k (only the ones services[] turned on) per scenario.
         # Reads the project's values.yaml + rdx render's overlay so the
         # filter sees both static + DSL-derived enabled flags. Idempotent:
@@ -1497,14 +1500,14 @@ if __name__ == "__main__":
         '    fi; ' +
         '    echo "[rdx] helm dep update --skip-refresh $sub"; ' +
         '    helm dependency update --skip-refresh "$sub"; ' +
-        # AppCo packaging quirk: their Helm charts publish OCI artifact
+        # SUSE packaging quirk: their Helm charts publish OCI artifact
         # tags like "0.4.4-29.1" but Chart.yaml inside says version
         # "0.4.4". Helm matches deps against the INTERNAL version, so
         # when the library declares postgresql at "0.4.4-29.1" the alias
         # silently fails to resolve at template time and parent values
         # never reach the sub-chart (no app user, no auth db). Patch
         # each pulled sub-chart to align its internal version with what
-        # the parent expects. Drop when AppCo aligns version<->tag.
+        # the parent expects. Drop when SUSE aligns version<->tag.
         '    python3 "' + align_script_path + '" "$sub"; ' +
         '  done; ' +
         'fi'
@@ -1920,7 +1923,7 @@ if __name__ == "__main__":
         )
 
     # Surface each declared service on its conventional port. The
-    # workload name is NOT always <release>-<chart-name> — some AppCo
+    # workload name is NOT always <release>-<chart-name> — some SUSE
     # charts add a master/replica suffix (redis → <release>-redis-master,
     # prometheus → <release>-prometheus-server, mariadb-galera variants
     # → <release>-mariadb-primary, etc.). The authoritative source of the
