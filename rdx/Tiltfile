@@ -1627,6 +1627,36 @@ if __name__ == "__main__":
               'will not be regenerated. Install rdx CLI to keep services[] DSL ' +
               'in sync with sub-chart values. See idefxH/rdx-cli.')
 
+    # ─── Workspace overlay ───────────────────────────────────────────
+    # When the project participates in a workspace (`rdx workspace
+    # render` ran), each consumer gets a values.workspace.yaml at
+    # chart/.rdx/values.workspace.yaml carrying:
+    #   - `<chart>: { enabled: false }` per workspace-shared binding
+    #     type, disabling the consumer's matching local sub-chart so
+    #     two copies of postgres/redis/… don't fight for the same
+    #     namespace; and
+    #   - rdx-library.workspace.bindings → the {binding, type,
+    #     secretRef} triples the workload reads via secretKeyRef.
+    # Without this overlay the consumer brings up its own local
+    # sub-chart copy AND the workspace's binding-secret wiring is
+    # never applied, so the workload connects to the wrong backing.
+    # DevSpace already does the equivalent via its valuesFiles list
+    # (see internal/devspace/render.go) — Tilt needs the same
+    # discovery so the two orchestrators stay equivalent.
+    #
+    # Lives outside the `rdx_present` branch on purpose: the file is
+    # written by `rdx workspace render` at workspace-orchestration time
+    # (not at `tilt up` time), so it's already on disk when `tilt up`
+    # runs even on machines without rdx installed.
+    #
+    # Appended LAST so it wins helm's later-wins value merge over
+    # values.generated.yaml (the workspace overlay is the source of
+    # truth for cross-project binding wiring).
+    workspace_overlay = chart_path + '/.rdx/values.workspace.yaml'
+    if os.path.exists(workspace_overlay):
+        if workspace_overlay not in chart_values_files:
+            chart_values_files = chart_values_files + [workspace_overlay]
+
     helm_set = []
     if image_ref:
         helm_set.append('image.repository=' + _img_repo)
