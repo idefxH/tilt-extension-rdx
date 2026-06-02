@@ -1893,12 +1893,16 @@ if __name__ == "__main__":
             _wl_links = _ingress_links(_wl, domain=_domain_value)
             _resource_name = name + '-' + _wl_name
             if _wl_port:
-                # Forward local <port> to Service port 80 (the Service
-                # maps 80 → containerPort). Avoids duplicates with
-                # Tilt's auto-discovery of Service ports.
+                # Forward local <port> to the Service port, which equals
+                # the workload's containerPort: service.yaml renders
+                # `port: {{ $wl.port }}` with `targetPort: http`, so the
+                # Service is reached on the same number the container
+                # listens on (no fixed :80 indirection). Forwarding to a
+                # hardcoded :80 would miss a Service exposing e.g. 8083.
+                # Local side matches too, so the dev hits localhost:<port>.
                 k8s_resource(
                     workload=_resource_name,
-                    port_forwards='%d:80' % (_wl_port,),
+                    port_forwards='%d:%d' % (_wl_port, _wl_port),
                     labels=[labels.get(_resource_name, 'app')],
                     links=_wl_links,
                     auto_init=True,
