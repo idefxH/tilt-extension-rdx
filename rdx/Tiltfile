@@ -20,8 +20,8 @@
 # `rdx-library.services[]` entry (the unified DSL written by `rdx
 # add-service`) is registered. The app's HTTP port is read from
 # `rdx-library.port` in the same values.yaml — values.yaml is the source
-# of truth, so the Tiltfile stays terse. Override builder_image when
-# RDX-SUSE buildpacks ship.
+# of truth, so the Tiltfile stays terse. Pass builder='bci' to build with
+# the BCI builder (Paketo buildpacks) instead of the default heroku one.
 #
 # Pass `services={'<binding>': '<type>'}` explicitly only when you want to
 # register a service the chart doesn't deploy itself, or narrow the
@@ -65,6 +65,57 @@ allow_k8s_contexts(k8s_context())
 # heroku/nodejs (active, v5.5.8 on 2026-04-16), heroku/python,
 # heroku/go, heroku/java, heroku/ruby. Run image: heroku/heroku:24.
 DEFAULT_BUILDER = 'heroku/builder:24'
+
+# BCI CNB builder. Multi-arch (linux/amd64 + linux/arm64) builder built
+# on the SUSE BCI 16.0 stack and shipping Paketo buildpacks. Selected via
+# rdx_app(builder='bci'). Unlike upstream paketobuildpacks/builder-* (still
+# amd64-only as of 2026-04-27, hence the arm64 Rosetta problems noted
+# above) this image is published native for both arches, so the buildpack
+# inner loop runs natively on Apple Silicon.
+#
+# The image lives in a private registry, so `pack` needs local credentials
+# for ghcr.io at build time (`docker login ghcr.io`). See the preflight in
+# the build block below.
+BCI_BUILDER = 'ghcr.io/idefxh/builder-bci-base:16.0.2'
+
+# Builder selector -> builder image. `builder='heroku'` (default) keeps the
+# heroku/builder:24 + heroku/* buildpacks; `builder='bci'` switches to the
+# BCI builder + Paketo buildpacks (translated below). A raw `builder_image`
+# argument still overrides the resolved image for either selector.
+BUILDER_IMAGES = {
+    'heroku': DEFAULT_BUILDER,
+    'bci': BCI_BUILDER,
+}
+
+# heroku CNB buildpack ID -> Paketo equivalent. The BCI builder ships
+# Paketo buildpacks (paketo-buildpacks/*) rather than heroku's, so when
+# builder='bci' is selected every buildpack ID resolved from
+# LANGUAGE_DEFAULTS is translated through this map. IDs with no entry pass
+# through unchanged (e.g. a user's own extra_buildpacks already namespaced
+# for Paketo).
+HEROKU_TO_PAKETO_BUILDPACK = {
+    'heroku/nodejs':   'paketo-buildpacks/nodejs',
+    'heroku/python':   'paketo-buildpacks/python',
+    'heroku/java':     'paketo-buildpacks/java',
+    'heroku/go':       'paketo-buildpacks/go',
+    'heroku/ruby':     'paketo-buildpacks/ruby',
+    'heroku/procfile': 'paketo-buildpacks/procfile',
+}
+
+# Per-builder, per-language build-time env (pack --env) layered on top of
+# the language defaults' pack_build_env. heroku/nodejs decides dev-vs-prod
+# dependency install purely from NODE_ENV (set in LANGUAGE_DEFAULTS, honoured
+# by both builders). Paketo's nodejs buildpack additionally exposes BP_*
+# knobs: BP_NODE_RUN_SCRIPTS controls which npm scripts run at build time —
+# pinned empty here so no production `build` script fires during the dev
+# inner loop (the 'dev' Procfile process runs nodemon against ./src instead).
+# devDependencies (nodemon) are retained because NODE_ENV=development keeps
+# them in the install layer.
+BUILDER_BUILD_ENV = {
+    'bci': {
+        'nodejs': {'BP_NODE_RUN_SCRIPTS': ''},
+    },
+}
 
 # Per-language defaults. Live-update paths follow each buildpack's
 # expected workspace layout. Languages requiring a full rebuild on every
@@ -182,6 +233,7 @@ def rdx_app(
         services=None,
         chart_path=None,
         chart_values_files=None,
+        builder='heroku',
         builder_image=None,
         extra_buildpacks=[],
         additional_env={},
@@ -246,12 +298,24 @@ def rdx_app(
             deploy + port-forwards.
 
     Override:
-        builder_image (str): CNB builder image. Default Paketo full builder.
-            Override when RDX-SUSE buildpacks ship:
-            builder_image='registry.rdx.suse.com/builder:latest'.
+        builder (str): CNB builder family. 'heroku' (default) uses
+            heroku/builder:24 with heroku/* buildpacks; 'bci' uses the BCI
+            builder (ghcr.io/idefxh/builder-bci-base) with the equivalent
+            paketo-buildpacks/* IDs. The buildpack list resolved from the
+            language defaults is translated automatically — callers don't
+            restate buildpack IDs. With 'bci', `pack` needs local ghcr.io
+            credentials (run `docker login ghcr.io` once); a preflight warns
+            if none are found.
+        builder_image (str): raw CNB builder image, overriding the image
+            resolved from `builder` while keeping that builder's buildpack
+            family. E.g. pin a digest:
+            builder_image='ghcr.io/idefxh/builder-bci-base:16.0.2'.
         extra_buildpacks (list[str]): additional CNB buildpacks appended to
             the language defaults. Useful for the future RDX OTel buildpack
-            or a service-binding buildpack.
+            or a service-binding buildpack. These are appended verbatim —
+            namespace them for the selected builder (paketo-buildpacks/* when
+            builder='bci') as they are not run through the translation map
+            unless they match a known heroku/* ID.
         additional_env (dict): build-time env vars passed via `pack build --env`.
             E.g. {'BP_NODE_VERSION': '22'}.
         live_update_paths (list[str]): override default sync paths. Pass an
@@ -480,8 +544,40 @@ def rdx_app(
             _img_tag = 'latest'
     else:
         defaults = LANGUAGE_DEFAULTS[language]
-        builder = builder_image or DEFAULT_BUILDER
-        buildpacks = defaults['buildpacks'] + extra_buildpacks
+
+        # Resolve the builder family. `builder` selects heroku (default) or
+        # bci; `builder_image` is a raw image override layered on top.
+        _builder_kind = builder or 'heroku'
+        if _builder_kind not in BUILDER_IMAGES:
+            fail('rdx_app: unknown builder %r. Supported: %s' % (
+                _builder_kind, ', '.join(sorted(BUILDER_IMAGES.keys()))))
+        builder = builder_image or BUILDER_IMAGES[_builder_kind]
+
+        # Translate buildpack IDs for the BCI builder (Paketo buildpacks).
+        # heroku is the source of truth in LANGUAGE_DEFAULTS; unknown IDs
+        # (incl. user extra_buildpacks) pass through unchanged.
+        _base_buildpacks = defaults['buildpacks']
+        if _builder_kind == 'bci':
+            _base_buildpacks = [HEROKU_TO_PAKETO_BUILDPACK.get(bp, bp) for bp in _base_buildpacks]
+        buildpacks = _base_buildpacks + extra_buildpacks
+
+        # Preflight: the BCI builder lives in a private registry, so `pack`
+        # must be able to pull it (and its run image) with local ghcr.io
+        # credentials. Warn — don't hard-fail — because credential helpers
+        # (osxkeychain, ecr-login) store auth outside ~/.docker/config.json
+        # where this cheap grep can't see it. Set RDX_SKIP_GHCR_CHECK=1 to
+        # silence. The actual pull failure (if any) surfaces with a clear
+        # 401 from pack itself.
+        if _builder_kind == 'bci' and os.getenv('RDX_SKIP_GHCR_CHECK', '') != '1':
+            local(
+                "if [ -f \"$HOME/.docker/config.json\" ] && " +
+                "grep -q 'ghcr.io' \"$HOME/.docker/config.json\" 2>/dev/null; then exit 0; fi; " +
+                "echo '[rdx] WARN: no ghcr.io entry in ~/.docker/config.json. " +
+                "The BCI builder (" + builder + ") is in a private registry; " +
+                "run `docker login ghcr.io` if `pack build` fails to pull it. " +
+                "Set RDX_SKIP_GHCR_CHECK=1 to silence this check.' >&2",
+                quiet=False, echo_off=True)
+
         sync_paths = live_update_paths if live_update_paths != None else defaults['live_update_paths']
 
         cache_dir = '/tmp/rdx-pack-cache-' + name
@@ -510,6 +606,10 @@ def rdx_app(
             if _has_dev_proc:
                 pack_args.extend(['--default-process', dev_proc])
         for k, v in (defaults.get('pack_build_env') or {}).items():
+            pack_args.extend(['--env', '%s=%s' % (k, v)])
+        # Builder-specific env (e.g. Paketo BP_* knobs for the BCI builder)
+        # layered on top of the language defaults above.
+        for k, v in (BUILDER_BUILD_ENV.get(_builder_kind, {}).get(language, {}) or {}).items():
             pack_args.extend(['--env', '%s=%s' % (k, v)])
         pack_args.extend(['--path', build_path])
         pack_cmd = ' '.join(pack_args)
