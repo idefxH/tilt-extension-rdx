@@ -379,10 +379,20 @@ def rdx_app(
     # source of truth, rdx-cli 0.1.47+), with a Starlark fallback for
     # older rdx binaries. Reads `.rdx/project.yaml` namespace.local,
     # substitutes {{.project}} / {{.user}}.
-    rdx_can_expand = str(local(
-        'command -v rdx > /dev/null 2>&1 && rdx namespace --help > /dev/null 2>&1 && echo yes || echo no',
-        quiet=True, echo_off=True)).strip()
-    if rdx_can_expand == 'yes':
+    # Probe for the rdx binary once per rdx_app() call and reuse the result
+    # at every downstream site (namespace expansion here, `rdx render`
+    # later). A single shell-out reports both whether rdx is on PATH and
+    # whether it understands the `namespace` subcommand (rdx-cli 0.1.47+,
+    # which owns canonical namespace expansion), so we don't pay for
+    # repeated blocking probes on every Tiltfile re-eval.
+    _rdx_probe = str(local(
+        'if command -v rdx > /dev/null 2>&1; then ' +
+        'if rdx namespace --help > /dev/null 2>&1; then echo "yes yes"; ' +
+        'else echo "yes no"; fi; else echo "no no"; fi',
+        quiet=True, echo_off=True)).strip().split()
+    _rdx_present = len(_rdx_probe) > 0 and _rdx_probe[0] == 'yes'
+    _rdx_can_expand = len(_rdx_probe) > 1 and _rdx_probe[1] == 'yes'
+    if _rdx_can_expand:
         namespace = str(local('rdx namespace expand', quiet=True, echo_off=True)).strip()
         if not namespace:
             fail('rdx_app: `rdx namespace expand` returned empty output. Check `.rdx/project.yaml`.')
@@ -405,15 +415,34 @@ def rdx_app(
                 'so this extension can shell out to `rdx namespace expand` instead.'
             ) % (ns_template, namespace))
 
+    # ─── One-shot bootstrap guard ──────────────────────────────────────
+    # Namespace creation and the pull-secret mirror below only need to run
+    # once per session, but Tilt re-evaluates this whole Tiltfile on every
+    # file save. Gate the blocking kubectl round-trips behind a /tmp
+    # sentinel so steady-state reloads skip them (~7 cluster API calls per
+    # reload otherwise). The sentinel lives in /tmp, so a reboot — a
+    # genuinely fresh session — starts clean.
+    #
+    # The sentinel isn't trusted blindly: one `kubectl get namespace`
+    # doubles as a liveness probe, so if the namespace is torn down
+    # out-of-band the next re-eval rebuilds it (and re-mirrors the secret).
+    # That single call replaces the handful the full bootstrap makes.
+    _bootstrap_sentinel = '/tmp/rdx-' + namespace + '-bootstrapped'
+    _bootstrap_done = os.path.exists(_bootstrap_sentinel) and str(local(
+        'kubectl get namespace ' + namespace +
+        ' > /dev/null 2>&1 && echo yes || echo no',
+        quiet=True, echo_off=True)).strip() == 'yes'
+
     # Pre-create the namespace idempotently. Tilt invokes `helm template`
     # (not `helm install --create-namespace`) so the namespace must exist
     # before k8s_yaml applies the rendered manifests. `kubectl create
     # --dry-run=client | kubectl apply` is idempotent — succeeds whether
     # the namespace is new or already there.
-    local(
-        'kubectl create namespace ' + namespace +
-        ' --dry-run=client -o yaml | kubectl apply -f -',
-        quiet=True, echo_off=True)
+    if not _bootstrap_done:
+        local(
+            'kubectl create namespace ' + namespace +
+            ' --dry-run=client -o yaml | kubectl apply -f -',
+            quiet=True, echo_off=True)
 
     # Mirror the application-collection imagePullSecret from `default` to
     # the deploy namespace if it's missing. Background:
@@ -453,7 +482,7 @@ def rdx_app(
     #
     # Step 0 (target-NS already has it) is the universal safety net:
     # whatever distribution mechanism wrote it first, we don't touch.
-    if os.getenv('RDX_SKIP_PULLSECRET_MIRROR', '') != '1':
+    if not _bootstrap_done and os.getenv('RDX_SKIP_PULLSECRET_MIRROR', '') != '1':
         local(
             "set -e; " +
             # Step 0: target NS already has the Secret — done.
@@ -505,6 +534,13 @@ def rdx_app(
             "echo '[rdx] mirrored Secret/application-collection " +
             "default -> " + namespace + "'",
             quiet=False, echo_off=True)
+
+    # Record that this namespace was bootstrapped so subsequent reloads
+    # skip the work above. Touched on the cold path regardless of whether
+    # the mirror ran (RDX_SKIP_PULLSECRET_MIRROR=1 / operator-managed
+    # clusters still want the skip on later reloads).
+    if not _bootstrap_done:
+        local('touch ' + _bootstrap_sentinel, quiet=True, echo_off=True)
 
     # ─── Workloads[] detection ──────────────────────────────────────────
     # New DSL (bundle v0.11+): `rdx-library.workloads[]` array in
@@ -707,7 +743,6 @@ def rdx_app(
     # /tmp at runtime avoids the path-discovery problem with extensions
     # loaded via ext:// (no __file__ equivalent in Starlark, and
     # read_file() resolves relative to the user's project Tiltfile).
-    align_script_path = '/tmp/_rdx_align_subchart_versions.py'
     align_script_src = r'''#!/usr/bin/env python3
 """
 Align vendored sub-chart Chart.yaml versions with the parent's dep
@@ -824,7 +859,14 @@ def main(parent_dir):
 if __name__ == "__main__":
     main(sys.argv[1])
 '''
-    local('cat > ' + align_script_path + " <<'__RDX_PY_EOF__'\n" + align_script_src + "\n__RDX_PY_EOF__", echo_off=True, quiet=True)
+    # Content-addressed path: the filename embeds a hash of the script body,
+    # so the write is naturally idempotent — an unchanged script maps to a
+    # path that already exists and we skip the blocking write on every
+    # reload; an edited script maps to a new path and is written once.
+    align_script_path = ('/tmp/_rdx_align_subchart_versions.' +
+                         str(hash(align_script_src) & 0x7fffffff) + '.py')
+    if not os.path.exists(align_script_path):
+        local('cat > ' + align_script_path + " <<'__RDX_PY_EOF__'\n" + align_script_src + "\n__RDX_PY_EOF__", echo_off=True, quiet=True)
 
     # Filter the library chart's deps down to ONLY the sub-charts the
     # project has enabled. Without this, every `helm dep update` pulls
@@ -842,7 +884,6 @@ if __name__ == "__main__":
     # Idempotent: if Chart.yaml.full exists, restore from it before
     # filtering. Safe across rdx render re-runs (Tilt fires it on
     # every save in the chart tree).
-    filter_script_path = '/tmp/_rdx_filter_enabled_deps.py'
     filter_script_src = r'''#!/usr/bin/env python3
 """
 Strip the library Chart.yaml deps down to only the sub-charts the
@@ -1410,7 +1451,11 @@ if __name__ == "__main__":
         sys.exit(2)
     main(*sys.argv[1:])
 '''
-    local('cat > ' + filter_script_path + " <<'__RDX_PY_EOF__'\n" + filter_script_src + "\n__RDX_PY_EOF__", echo_off=True, quiet=True)
+    # Content-addressed path — written once per script body (see align note).
+    filter_script_path = ('/tmp/_rdx_filter_enabled_deps.' +
+                          str(hash(filter_script_src) & 0x7fffffff) + '.py')
+    if not os.path.exists(filter_script_path):
+        local('cat > ' + filter_script_path + " <<'__RDX_PY_EOF__'\n" + filter_script_src + "\n__RDX_PY_EOF__", echo_off=True, quiet=True)
 
     # Pre-flight helper: ensure every non-OCI repo URL referenced by the
     # library Chart.yaml is registered with `helm repo add` BEFORE
@@ -1422,7 +1467,6 @@ if __name__ == "__main__":
     #
     # OCI repos (oci://dp.apps.rancher.io/charts) are skipped — Helm
     # talks to them directly without an index cache.
-    bootstrap_repos_script_path = '/tmp/_rdx_bootstrap_helm_repos.py'
     bootstrap_repos_script_src = r'''#!/usr/bin/env python3
 """
 Walk a library chart's Chart.yaml.full (or Chart.yaml as fallback) and
@@ -1541,7 +1585,11 @@ if __name__ == "__main__":
         sys.exit(2)
     main(sys.argv[1])
 '''
-    local('cat > ' + bootstrap_repos_script_path + " <<'__RDX_PY_EOF__'\n" + bootstrap_repos_script_src + "\n__RDX_PY_EOF__", echo_off=True, quiet=True)
+    # Content-addressed path — written once per script body (see align note).
+    bootstrap_repos_script_path = ('/tmp/_rdx_bootstrap_helm_repos.' +
+                                   str(hash(bootstrap_repos_script_src) & 0x7fffffff) + '.py')
+    if not os.path.exists(bootstrap_repos_script_path):
+        local('cat > ' + bootstrap_repos_script_path + " <<'__RDX_PY_EOF__'\n" + bootstrap_repos_script_src + "\n__RDX_PY_EOF__", echo_off=True, quiet=True)
 
     # Speed: skip helm dep update when the cache is fresh.
     #   - --skip-refresh: don't update the 15+ helm repos (metallb, harbor,
@@ -1673,10 +1721,8 @@ if __name__ == "__main__":
     #     downstream helm template will fail loud anyway via
     #     validateConsistency if the user hasn't manually maintained the
     #     equivalent values.
-    rdx_present = str(local(
-        'command -v rdx > /dev/null 2>&1 && echo present || echo missing',
-        quiet=True, echo_off=True)).strip()
-    if rdx_present == 'present':
+    # Reuse the rdx-presence probe taken once at the top of rdx_app().
+    if _rdx_present:
         # Run from chart_path's parent: `rdx render` resolves the project
         # via cwd, and the project's chart_dir is computed relative to
         # the .rdx/project.yaml location.
