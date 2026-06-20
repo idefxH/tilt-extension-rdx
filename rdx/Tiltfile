@@ -80,26 +80,12 @@ BCI_BUILDER = 'ghcr.io/idefxh/builder-bci-base:16.0.2'
 
 # Builder selector -> builder image. `builder='heroku'` (default) keeps the
 # heroku/builder:24 + heroku/* buildpacks; `builder='bci'` switches to the
-# BCI builder + Paketo buildpacks (translated below). A raw `builder_image`
-# argument still overrides the resolved image for either selector.
+# BCI builder, which ships Paketo buildpacks and resolves them by its own
+# detection order. A raw `builder_image` argument still overrides the
+# resolved image for either selector.
 BUILDER_IMAGES = {
     'heroku': DEFAULT_BUILDER,
     'bci': BCI_BUILDER,
-}
-
-# heroku CNB buildpack ID -> Paketo equivalent. The BCI builder ships
-# Paketo buildpacks (paketo-buildpacks/*) rather than heroku's, so when
-# builder='bci' is selected every buildpack ID resolved from
-# LANGUAGE_DEFAULTS is translated through this map. IDs with no entry pass
-# through unchanged (e.g. a user's own extra_buildpacks already namespaced
-# for Paketo).
-HEROKU_TO_PAKETO_BUILDPACK = {
-    'heroku/nodejs':   'paketo-buildpacks/nodejs',
-    'heroku/python':   'paketo-buildpacks/python',
-    'heroku/java':     'paketo-buildpacks/java',
-    'heroku/go':       'paketo-buildpacks/go',
-    'heroku/ruby':     'paketo-buildpacks/ruby',
-    'heroku/procfile': 'paketo-buildpacks/procfile',
 }
 
 # Per-builder, per-language build-time env (pack --env) layered on top of
@@ -300,22 +286,24 @@ def rdx_app(
     Override:
         builder (str): CNB builder family. 'heroku' (default) uses
             heroku/builder:24 with heroku/* buildpacks; 'bci' uses the BCI
-            builder (ghcr.io/idefxh/builder-bci-base) with the equivalent
-            paketo-buildpacks/* IDs. The buildpack list resolved from the
-            language defaults is translated automatically — callers don't
-            restate buildpack IDs. With 'bci', `pack` needs local ghcr.io
-            credentials (run `docker login ghcr.io` once); a preflight warns
-            if none are found.
+            builder (ghcr.io/idefxh/builder-bci-base), which ships Paketo
+            buildpacks and resolves the language buildpacks by its own
+            detection order — callers don't restate buildpack IDs. With
+            'bci', `pack` needs local ghcr.io credentials (run
+            `docker login ghcr.io` once); a preflight warns if none are
+            found.
         builder_image (str): raw CNB builder image, overriding the image
             resolved from `builder` while keeping that builder's buildpack
             family. E.g. pin a digest:
             builder_image='ghcr.io/idefxh/builder-bci-base:16.0.2'.
-        extra_buildpacks (list[str]): additional CNB buildpacks appended to
-            the language defaults. Useful for the future RDX OTel buildpack
-            or a service-binding buildpack. These are appended verbatim —
-            namespace them for the selected builder (paketo-buildpacks/* when
-            builder='bci') as they are not run through the translation map
-            unless they match a known heroku/* ID.
+        extra_buildpacks (list[str]): additional CNB buildpacks. Useful for
+            the future RDX OTel buildpack or a service-binding buildpack.
+            These are passed verbatim — namespace them for the selected
+            builder (paketo-buildpacks/* when builder='bci') and pin a
+            version, since the BCI builder bundles multiple versions of each
+            buildpack. With builder='heroku' they are appended to the
+            language defaults; with builder='bci' they are the only
+            buildpacks named explicitly (the builder detects the rest).
         additional_env (dict): build-time env vars passed via `pack build --env`.
             E.g. {'BP_NODE_VERSION': '22'}.
         live_update_paths (list[str]): override default sync paths. Pass an
@@ -553,13 +541,17 @@ def rdx_app(
                 _builder_kind, ', '.join(sorted(BUILDER_IMAGES.keys()))))
         builder = builder_image or BUILDER_IMAGES[_builder_kind]
 
-        # Translate buildpack IDs for the BCI builder (Paketo buildpacks).
-        # heroku is the source of truth in LANGUAGE_DEFAULTS; unknown IDs
-        # (incl. user extra_buildpacks) pass through unchanged.
-        _base_buildpacks = defaults['buildpacks']
+        # Resolve the buildpack list. The BCI builder bundles multiple
+        # versions of each Paketo buildpack, so naming one without a version
+        # is ambiguous and `pack` refuses to build. Instead let the builder's
+        # built-in detection order resolve the language buildpacks
+        # (node-engine -> npm-install -> procfile, and the equivalents for
+        # other languages). Only caller-supplied extra_buildpacks are passed
+        # explicitly, with whatever version the caller pins.
         if _builder_kind == 'bci':
-            _base_buildpacks = [HEROKU_TO_PAKETO_BUILDPACK.get(bp, bp) for bp in _base_buildpacks]
-        buildpacks = _base_buildpacks + extra_buildpacks
+            buildpacks = list(extra_buildpacks)
+        else:
+            buildpacks = defaults['buildpacks'] + extra_buildpacks
 
         # Preflight: the BCI builder lives in a private registry, so `pack`
         # must be able to pull it (and its run image) with local ghcr.io
