@@ -33,12 +33,31 @@ except ImportError:
 # Reimplemented core logic (mirrors the Tiltfile-embedded script exactly).
 # ---------------------------------------------------------------------------
 
-SKIP_TOP = {
-    "rdx-library", "global", "image", "ingress",
-    "imagePullSecrets", "resources", "probes", "metrics",
-    "podAnnotations", "service", "name", "replicas",
-    "port", "apiVersion", "kind",
-}
+def _lib_block(data, lib_key):
+    """Mirror of the Tiltfile-embedded helper.
+
+    Resolve the library sub-block, preferring the detected `lib_key` and
+    falling back to the conventional names. The library values key is the
+    vendored dep name, which varies across bundles (`suse-library`,
+    `rdx-library`, ...) — hardcoding one yields an empty enabled-set and
+    the filter drops every dep.
+    """
+    for k in (lib_key, "rdx-library", "suse-library"):
+        if k:
+            blk = data.get(k)
+            if isinstance(blk, dict):
+                return blk
+    return None
+
+
+def _skip_top(lib_key):
+    """Top-level keys excluded from the legacy `<chart>.enabled` scan."""
+    return {
+        lib_key, "rdx-library", "suse-library", "global", "image",
+        "ingress", "imagePullSecrets", "resources", "probes", "metrics",
+        "podAnnotations", "service", "name", "replicas",
+        "port", "apiVersion", "kind",
+    }
 
 
 def _is_deploy_provisioning(value):
@@ -84,7 +103,7 @@ def _is_overlay_file(path):
             p == "values.generated.yaml")
 
 
-def enabled_charts(values_files, dsl_mappings=None):
+def enabled_charts(values_files, dsl_mappings=None, lib_key="rdx-library"):
     """Union the chart names with .enabled=true across all values files.
 
     `dsl_mappings` (optional) is a dict shaped like the parsed
@@ -107,7 +126,7 @@ def enabled_charts(values_files, dsl_mappings=None):
         if not isinstance(data, dict):
             continue
         is_overlay = _is_overlay_file(path)
-        sl = data.get("rdx-library")
+        sl = _lib_block(data, lib_key)
         if isinstance(sl, dict):
             for name, sub in sl.items():
                 if isinstance(sub, dict) and sub.get("enabled") is True:
@@ -146,8 +165,9 @@ def enabled_charts(values_files, dsl_mappings=None):
                     enabled.add(chart_type)
                     if type_counts.get(chart_type, 0) > 1 and binding:
                         enabled.add(chart_type + "-" + binding)
+        skip_top = _skip_top(lib_key)
         for name, sub in data.items():
-            if name in SKIP_TOP:
+            if name in skip_top:
                 continue
             if isinstance(sub, dict) and sub.get("enabled") is True:
                 enabled.add(name)
@@ -167,7 +187,7 @@ def enabled_charts(values_files, dsl_mappings=None):
     return enabled
 
 
-def filter_deps(full_deps, enabled, values_files):
+def filter_deps(full_deps, enabled, values_files, lib_key="rdx-library"):
     """Filter and expand deps based on enabled charts and multi-instance aliases."""
     expanded_deps = list(full_deps)
     multi_aliases = {}
@@ -183,7 +203,7 @@ def filter_deps(full_deps, enabled, values_files):
                 data = yaml.safe_load(f) or {}
         except Exception:
             continue
-        sl = data.get("rdx-library")
+        sl = _lib_block(data, lib_key)
         if not isinstance(sl, dict):
             continue
         services = sl.get("services") or []
@@ -1145,6 +1165,71 @@ def test_bad_workload_name_guard():
         )
 
 
+def test_non_default_library_key():
+    """Values nested under a non-default library key are still detected.
+
+    Regression: the library values key is the vendored dep name and varies
+    across bundles (e.g. `suse-library`). When the filter assumed a fixed
+    `rdx-library`, every dep was dropped (`kept 0/N`) for a `suse-library`
+    project even though services were enabled. The key must be data-driven.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="rdx-test-filter-")
+    try:
+        values_path = os.path.join(tmpdir, "values.yaml")
+        # Both shapes under the non-default key: services[] + <chart>.enabled.
+        values = {
+            "suse-library": {
+                "name": "app",
+                "services": [
+                    {"type": "postgresql", "binding": "db", "enabled": True,
+                     "provisioning": "deploy"},
+                ],
+                "grafana": {"enabled": True},
+                "minio": {"enabled": False},
+            },
+        }
+        with open(values_path, "w") as f:
+            yaml.safe_dump(values, f, default_flow_style=False)
+
+        enabled = enabled_charts([values_path], lib_key="suse-library")
+        full_deps = FULL_CHART_YAML["dependencies"]
+        kept = filter_deps(full_deps, enabled, [values_path],
+                           lib_key="suse-library")
+        kept_names = sorted([d.get("alias", d.get("name")) for d in kept])
+
+        report(
+            "non-default key: services[] + <chart>.enabled both detected",
+            enabled == {"postgresql", "grafana"},
+            "got %s" % enabled,
+        )
+        report(
+            "non-default key: only enabled deps kept (not 0/N)",
+            kept_names == ["grafana", "postgresql"],
+            "got %s" % kept_names,
+        )
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_lib_block_falls_back_across_keys():
+    """`_lib_block` resolves the detected key, then conventional fallbacks."""
+    report(
+        "_lib_block: detected key wins",
+        _lib_block({"suse-library": {"a": 1}}, "suse-library") == {"a": 1},
+        "lookup by detected key failed",
+    )
+    report(
+        "_lib_block: falls back to rdx-library when detected key absent",
+        _lib_block({"rdx-library": {"b": 2}}, "nonexistent") == {"b": 2},
+        "fallback to rdx-library failed",
+    )
+    report(
+        "_lib_block: returns None when no library block present",
+        _lib_block({"unrelated": {}}, "suse-library") is None,
+        "expected None",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -1170,6 +1255,8 @@ def main():
     test_redacted_dep_name_dropped_from_kept()
     test_is_redacted_helper()
     test_bad_workload_name_guard()
+    test_non_default_library_key()
+    test_lib_block_falls_back_across_keys()
 
     print("\n-- %d passed, %d failed --" % (passed, failed))
     return 1 if failed else 0

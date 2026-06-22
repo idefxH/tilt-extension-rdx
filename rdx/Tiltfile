@@ -206,6 +206,43 @@ if _rdx_default_registry:
 if os.getenv('RDX_ENABLE_TILT_SCRUB', '') != '1':
     secret_settings(disable_scrub=True)
 
+def _detect_lib_key(chart_path):
+    """Return the top-level values key the project nests its DSL under.
+
+    The opinionated library chart is a vendored dependency
+    (chart_path/charts/<name>/) and a project's values place the DSL
+    (`services[]`, `workloads[]`, `port`, per-chart `<chart>.enabled`)
+    under a top-level key equal to that dependency's name (Helm nests a
+    sub-chart's values under its dep name/alias). Bundles ship the library
+    under different names, so this key is NOT a constant: it must be read
+    from the chart, not assumed. Detect it instead of hardcoding so the
+    extension tracks whatever the bundle vendors.
+
+    Resolution order:
+      1. A dependency whose vendored dir carries dsl-mappings.yaml — the
+         unambiguous signature of the library chart (only available once
+         `helm dep update` has run).
+      2. Cold start (deps not vendored yet): a dependency whose name ends
+         in `-library`.
+      3. A conventionally-named dir present on disk.
+      4. The modern default.
+    """
+    chart_meta = read_yaml(chart_path + '/Chart.yaml', default={})
+    deps = chart_meta.get('dependencies') or []
+    for dep in deps:
+        nm = dep.get('alias') or dep.get('name') or ''
+        if nm and os.path.exists(chart_path + '/charts/' + nm + '/dsl-mappings.yaml'):
+            return nm
+    for dep in deps:
+        nm = dep.get('alias') or dep.get('name') or ''
+        if nm.endswith('-library'):
+            return nm
+    for cand in ['rdx-library', 'suse-library']:
+        if os.path.exists(chart_path + '/charts/' + cand):
+            return cand
+    return 'rdx-library'
+
+
 # Conventional ports for service types declared in `services`. Used by
 # port_forwards so a developer can `psql -h localhost -p 5432`, etc.
 # Legacy hardcoded ports — used as fallback when dsl-mappings.yaml
@@ -337,6 +374,14 @@ def rdx_app(
             chart_path = 'chart'
         else:
             chart_path = 'chart'
+
+    # ─── Library values key detection ──────────────────────────────────
+    # Every read of the project's DSL nests under this key. Detect it from
+    # the vendored library dependency rather than assuming a fixed name —
+    # bundles ship the library chart under different names and a hardcoded
+    # key silently reads nothing (no services discovered, no charts kept by
+    # the dep filter, wrong workload names).
+    _lib_key = _detect_lib_key(chart_path)
 
     # ─── Stage auto-detection ──────────────────────────────────────────
     # Resolve the RDX stage once, used by every `rdx render --stage`
@@ -516,7 +561,7 @@ def rdx_app(
     if chart_values_files != None and len(chart_values_files) > 0:
         _primary_values_file = chart_values_files[0]
     _early_values = read_yaml(_primary_values_file, default={})
-    _early_lib = (_early_values.get('rdx-library', {}) or {})
+    _early_lib = (_early_values.get(_lib_key, {}) or {})
     _workloads = _early_lib.get('workloads') or []
 
     # ─── Image strategy: pack build / pre-built image / helm-only ───
@@ -960,6 +1005,37 @@ def _is_overlay_file(path):
             p == "values.generated.yaml")
 
 
+def _lib_key_for(library_dir):
+    """Top-level values key the project nests its DSL under.
+
+    `library_dir` is the vendored sub-chart dir (charts/<name>/); its
+    basename is the dependency name, which is exactly the key Helm nests
+    the sub-chart's values under. The library chart ships under different
+    names across bundles, so the key is data-driven, NOT a constant —
+    assuming a fixed name silently yields an empty enabled-set and the
+    filter drops every dep (`kept 0/N`).
+    """
+    if library_dir:
+        base = os.path.basename(os.path.normpath(library_dir))
+        if base:
+            return base
+    return "rdx-library"
+
+
+def _lib_block(data, lib_key):
+    """The library sub-block from one values doc, tolerant of key drift.
+
+    Prefers the detected `lib_key`; falls back to the conventional names
+    in case a dep `alias` diverges from its vendored dir name.
+    """
+    for k in (lib_key, "rdx-library", "suse-library"):
+        if k:
+            blk = data.get(k)
+            if isinstance(blk, dict):
+                return blk
+    return None
+
+
 def enabled_charts(values_files, library_dir=None):
     """Union the chart names with .enabled=true across all values files.
 
@@ -987,9 +1063,10 @@ def enabled_charts(values_files, library_dir=None):
     """
     yaml = _yaml()
     enabled = set()
-    SKIP_TOP = {"rdx-library", "global", "image", "ingress",
-                "imagePullSecrets", "resources", "probes", "metrics",
-                "podAnnotations", "service", "name", "replicas",
+    lib_key = _lib_key_for(library_dir)
+    SKIP_TOP = {lib_key, "rdx-library", "suse-library", "global", "image",
+                "ingress", "imagePullSecrets", "resources", "probes",
+                "metrics", "podAnnotations", "service", "name", "replicas",
                 "port", "apiVersion", "kind"}
     for path in values_files:
         if not os.path.isfile(path):
@@ -1002,11 +1079,11 @@ def enabled_charts(values_files, library_dir=None):
         if not isinstance(data, dict):
             continue
         is_overlay = _is_overlay_file(path)
-        # Shape 1+2: under rdx-library.<chart>.enabled — read from ALL
+        # Shape 1+2: under <lib-key>.<chart>.enabled — read from ALL
         # files, INCLUDING the overlay. The overlay's whole point is to
         # carry chart-level `<chart>.enabled` overrides written by
         # `rdx render` for each service[] entry it processed.
-        sl = data.get("rdx-library")
+        sl = _lib_block(data, lib_key)
         if isinstance(sl, dict):
             for name, sub in sl.items():
                 if isinstance(sub, dict) and sub.get("enabled") is True:
@@ -1116,6 +1193,7 @@ def enabled_charts(values_files, library_dir=None):
 def main(library_dir, *values_files):
     chart_yaml = os.path.join(library_dir, "Chart.yaml")
     full_backup = chart_yaml + ".full"
+    lib_key = _lib_key_for(library_dir)
     if not os.path.isfile(chart_yaml):
         return
 
@@ -1153,7 +1231,7 @@ def main(library_dir, *values_files):
                 data = _yaml().safe_load(f) or {}
         except Exception:
             continue
-        sl = data.get("rdx-library")
+        sl = _lib_block(data, lib_key)
         if not isinstance(sl, dict):
             continue
         services = sl.get("services") or []
@@ -1225,7 +1303,7 @@ def main(library_dir, *values_files):
                     data = _yaml().safe_load(f) or {}
             except Exception:
                 continue
-            sl = data.get("rdx-library")
+            sl = _lib_block(data, lib_key)
             if not isinstance(sl, dict):
                 continue
             for entry in (sl.get("services") or []):
@@ -1275,7 +1353,7 @@ def main(library_dir, *values_files):
                     data = _yaml().safe_load(f) or {}
             except Exception:
                 continue
-            sl = data.get("rdx-library")
+            sl = _lib_block(data, lib_key)
             if not isinstance(sl, dict):
                 continue
             for entry in (sl.get("services") or []):
@@ -1789,7 +1867,7 @@ if __name__ == "__main__":
         # Legacy single-workload port discovery.
         discovered_port = 8080
         for cfg in parsed_values:
-            lib = (cfg.get('rdx-library', {}) or {}) if cfg else {}
+            lib = (cfg.get(_lib_key, {}) or {}) if cfg else {}
             if 'port' in lib:
                 discovered_port = lib['port']
         if port == None:
@@ -1797,11 +1875,11 @@ if __name__ == "__main__":
         elif port != discovered_port:
             fail((
                 'rdx_app: port=%d passed explicitly but chart/values.yaml has ' +
-                'rdx-library.port=%d. The two would drift on every edit. ' +
+                '%s.port=%d. The two would drift on every edit. ' +
                 'Drop the port argument from rdx_app(...) — values.yaml is the ' +
                 'source of truth (see rdx-docs/concepts/dsl.md). If you really ' +
                 'need to override, change values.yaml.'
-            ) % (port, discovered_port))
+            ) % (port, _lib_key, discovered_port))
 
     # Auto-discover services from `rdx-library.services[]` (the unified
     # DSL in bundle v0.10+). Each entry has {binding, type, provisioning}
@@ -1842,7 +1920,7 @@ if __name__ == "__main__":
         for i in range(len(parsed_values)):
             cfg = parsed_values[i]
             cfg_path = parsed_values_paths[i]
-            lib = (cfg.get('rdx-library', {}) or {}) if cfg else {}
+            lib = (cfg.get(_lib_key, {}) or {}) if cfg else {}
             # Always collect lib blocks — `_chart_enabled` below needs
             # to see chart-level `<chart>.enabled` flags written into
             # the overlay by `rdx render`.
@@ -1926,7 +2004,7 @@ if __name__ == "__main__":
     # Resolve {{.domain}} from the project's rdx-library.domain value.
     _domain_value = ''
     for _cfg in parsed_values:
-        _dl = (_cfg.get('rdx-library', {}) or {}) if _cfg else {}
+        _dl = (_cfg.get(_lib_key, {}) or {}) if _cfg else {}
         if 'domain' in _dl:
             _domain_value = _dl['domain']
 
@@ -1961,7 +2039,7 @@ if __name__ == "__main__":
         return out
 
     def _rdx_lib_block(values_dict, *path):
-        block = values_dict.get('rdx-library', {}) or {}
+        block = values_dict.get(_lib_key, {}) or {}
         for key in path:
             block = (block.get(key, {}) or {}) if hasattr(block, 'get') else {}
         return block
@@ -1972,7 +2050,7 @@ if __name__ == "__main__":
         # overlay values are included (last-wins, matches Helm stacking).
         _merged_workloads = []
         for cfg in parsed_values:
-            lib = (cfg.get('rdx-library', {}) or {}) if cfg else {}
+            lib = (cfg.get(_lib_key, {}) or {}) if cfg else {}
             wls = lib.get('workloads')
             if wls:
                 _merged_workloads = wls
@@ -2015,7 +2093,7 @@ if __name__ == "__main__":
         # ─── Legacy single-workload mode ────────────────────────────────
         app_links = []
         for cfg in parsed_values:
-            app_links.extend(_ingress_links(cfg.get('rdx-library', {}) or {}, domain=_domain_value))
+            app_links.extend(_ingress_links(cfg.get(_lib_key, {}) or {}, domain=_domain_value))
 
         k8s_resource(
             workload=name,
@@ -2037,7 +2115,7 @@ if __name__ == "__main__":
     # entry, render the host template by substituting .Release.Name.
     # Fallback when the file is absent (older bundle) or the type isn't
     # catalogued: the legacy <release>-<service_type> assumption.
-    mappings_path = chart_path + '/charts/rdx-library/dsl-mappings.yaml'
+    mappings_path = chart_path + '/charts/' + _lib_key + '/dsl-mappings.yaml'
     mappings_doc = read_yaml(mappings_path, default={'charts': {}})
     catalogued_charts = mappings_doc.get('charts', {})
 
@@ -2426,10 +2504,11 @@ if __name__ == "__main__":
 
 def _check_ingress_conflicts(chart_path, values_files, namespace):
     """Warn if any ingress hostname is already claimed by another namespace."""
+    lib_key = _detect_lib_key(chart_path)
     hosts = []
     for vfile in values_files:
         vals = read_yaml(vfile, default={})
-        sl = vals.get('rdx-library', {})
+        sl = vals.get(lib_key, {})
         domain = sl.get('domain', '')
         for svc in sl.get('services', []):
             if not svc.get('enabled', False):
