@@ -2103,6 +2103,24 @@ if __name__ == "__main__":
         if not _merged_workloads:
             _merged_workloads = _workloads
 
+        # The library chart names each workload Deployment with the
+        # `rdx-library.name` helper, defined as `default .Release.Name
+        # .Values.name` — so when the project's values set `<lib>.name`,
+        # THAT (not the Helm release name) is the workload prefix. The
+        # release name (this function's `name` arg, passed to helm() as
+        # name=name) is NOT always that value: a project can deploy under
+        # a release that differs from its DSL name. Compute the SAME
+        # effective prefix the chart uses, last-wins across parsed_values
+        # to match Helm's --values stacking, so our `workload=` matches
+        # the rendered Deployment. Using `name` blindly registered
+        # `<release>-<wl>` against a manifest carrying `<lib-name>-<wl>`,
+        # which aborts the Tiltfile with `unknown resource`.
+        _chart_name = name
+        for cfg in parsed_values:
+            lib = (cfg.get(_lib_key, {}) or {}) if cfg else {}
+            if lib.get('name'):
+                _chart_name = lib['name']
+
         for _wl in _merged_workloads:
             _wl_name = _wl.get('name', 'app')
             _wl_port = _wl.get('port')
@@ -2112,7 +2130,7 @@ if __name__ == "__main__":
             # when localPort is absent (symmetric `8080:8080`).
             _local_port = _wl.get('localPort', _wl_port)
             _wl_links = _ingress_links(_wl, domain=_domain_value)
-            _resource_name = name + '-' + _wl_name
+            _resource_name = _chart_name + '-' + _wl_name
             if _wl_port:
                 # Forward local <localPort> to the Service port, which equals
                 # the workload's containerPort: service.yaml renders
