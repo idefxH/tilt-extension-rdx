@@ -684,8 +684,13 @@ def rdx_app(
         # layered on top of the language defaults above.
         for k, v in (BUILDER_BUILD_ENV.get(_builder_kind, {}).get(language, {}) or {}).items():
             pack_args.extend(['--env', '%s=%s' % (k, v)])
-        pack_args.extend(['--path', build_path])
-        pack_cmd = ' '.join(pack_args)
+        # Everything except --path is common to all workloads. Each
+        # workload entry may carry its own build_path (the real source
+        # dir, written into deploy/values.yaml by the rdx CLI); append
+        # --path per build below. Legacy single-workload mode uses the
+        # rdx_app() build_path argument.
+        pack_cmd_base = ' '.join(pack_args)
+        pack_cmd = pack_cmd_base + ' --path ' + build_path
 
         if language == 'go' and os.path.exists('go.mod'):
             local(
@@ -740,9 +745,13 @@ def rdx_app(
                 if _wl_image.get('tag') != 'dev':
                     continue
                 _wl_repo = _wl_image.get('repository', name)
+                # The rdx CLI writes the real source dir per workload into
+                # values.yaml; fall back to the rdx_app() build_path arg.
+                _build_path = _wl.get('build_path', build_path)
+                _wl_pack_cmd = pack_cmd_base + ' --path ' + _build_path
                 custom_build(
                     ref=_wl_repo,
-                    command=pack_cmd,
+                    command=_wl_pack_cmd,
                     deps=deps,
                     ignore=[chart_path, 'deploy', '.rdx', 'Tiltfile'],
                     # Match the image only where it appears as a container
