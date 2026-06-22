@@ -745,7 +745,15 @@ def rdx_app(
                     command=pack_cmd,
                     deps=deps,
                     ignore=[chart_path, 'deploy', '.rdx', 'Tiltfile'],
-                    match_in_env_vars=True,
+                    # Match the image only where it appears as a container
+                    # `image:` ref. match_in_env_vars would ALSO match the
+                    # bare ref against env-var VALUES, and a short repository
+                    # like 'app' collides with everyday env values (a DB
+                    # username, a service name). That makes Tilt attach this
+                    # pack build to an unrelated backing pod whose env merely
+                    # carries the string — e.g. postgresql's
+                    # _POSTGRES_INITIAL_USERNAME=app — and try to build it.
+                    match_in_env_vars=False,
                     skips_local_docker=_skips_local_docker,
                     disable_push=_disable_push,
                     live_update=live_update_steps if live_update_steps else None,
@@ -757,7 +765,9 @@ def rdx_app(
                 command=pack_cmd,
                 deps=deps,
                 ignore=[chart_path, 'deploy', '.rdx', 'Tiltfile'],
-                match_in_env_vars=True,
+                # See the workloads[] branch above: env-var matching on a
+                # short image ref attaches the build to unrelated pods.
+                match_in_env_vars=False,
                 skips_local_docker=_skips_local_docker,
                 disable_push=_disable_push,
                 live_update=live_update_steps if live_update_steps else None,
