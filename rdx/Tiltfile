@@ -243,6 +243,149 @@ def _detect_lib_key(chart_path):
     return 'rdx-library'
 
 
+# ─── CoreDNS hairpin DNS fix ────────────────────────────────────────────
+#
+# In k3s dev clusters, wildcard-loopback domains (`*.localtest.me`,
+# `*.lvh.me`, …) resolve to 127.0.0.1 EVERYWHERE — including inside pods.
+# A pod that calls an ingress-exposed peer by its public hostname
+# (`auth.localtest.me`) therefore hits its OWN loopback instead of the
+# Traefik ingress controller. The classic "hairpin" failure.
+#
+# k3s ships CoreDNS with `import /etc/coredns/custom/*.server` in its
+# Corefile and auto-mounts a ConfigMap named `coredns-custom` in
+# `kube-system` at `/etc/coredns/custom/` (`optional: true`). Adding a
+# `<name>.server` key there defines a new DNS zone. We point the dev
+# domain at the Traefik ClusterIP so in-cluster name resolution of the
+# public hostname lands on the ingress controller, which then routes by
+# Host header exactly as it does for external traffic.
+#
+# The ConfigMap is applied via k8s_yaml() so Tilt owns its lifecycle:
+# created at `tilt up`, deleted at `tilt down`. The fixed name
+# `coredns-custom` is a k3s convention (it's the specific name k3s
+# CoreDNS imports) — note that with that fixed name a single Tilt
+# session owns the object; running two rdx workspaces with different
+# loopback domains at once would have them contend for it.
+
+# Curated wildcard-loopback dev domains: every subdomain resolves to
+# 127.0.0.1 by design. Matched as the bare domain or any suffix. Extend
+# as new services appear; anything not listed falls through to a live
+# resolve so a custom loopback domain still works and a real domain
+# (staging.corp.com) never gets its DNS hijacked.
+_LOOPBACK_DOMAINS = [
+    'localtest.me',
+    'localhost.direct',
+    'lvh.me',
+    'vcap.me',
+    'sslip.io',
+    'nip.io',
+]
+
+
+def _domain_is_loopback(domain):
+    """True iff `domain` should have its DNS overridden to the ingress.
+
+    Fast path: the curated wildcard-loopback list. Slow path: resolve
+    the bare name on the dev's machine and accept it only when it answers
+    with a loopback address. This is the safety gate the spec requires —
+    we must never override DNS for a real domain.
+    """
+    if not domain:
+        return False
+    for known in _LOOPBACK_DOMAINS:
+        if domain == known or domain.endswith('.' + known):
+            return True
+    # Resolve with whatever the host has. getent (Linux), dig, then
+    # python3's resolver (macOS has no getent) — first non-empty wins.
+    # `|| true` keeps a fully tool-less host from failing the Tiltfile.
+    resolved = str(local(
+        "_d=" + domain + "; " +
+        "ip=$(getent hosts \"$_d\" 2>/dev/null | awk '{print $1; exit}'); " +
+        "[ -z \"$ip\" ] && ip=$(dig +short \"$_d\" A 2>/dev/null | " +
+        "grep -E '^[0-9.]+$' | head -1); " +
+        "[ -z \"$ip\" ] && ip=$(python3 -c " +
+        "'import socket,sys; print(socket.gethostbyname(sys.argv[1]))' " +
+        "\"$_d\" 2>/dev/null); " +
+        "echo \"$ip\" || true",
+        quiet=True, echo_off=True,
+    )).strip()
+    return resolved == '127.0.0.1' or resolved == '::1'
+
+
+def _ingress_cluster_ip():
+    """ClusterIP of the in-cluster ingress controller, or '' if absent.
+
+    Tries the common Traefik label selectors, then the conventional k3s
+    `kube-system/traefik` Service. Returns '' (caller warns, doesn't
+    fail) when nothing matches or the Service is headless (clusterIP
+    None), since a headless IP can't be used as a DNS target.
+    """
+    ip = str(local(
+        "ip=$(kubectl get svc -A -l 'app.kubernetes.io/name=traefik' " +
+        "-o jsonpath='{.items[0].spec.clusterIP}' 2>/dev/null); " +
+        "[ -z \"$ip\" ] && ip=$(kubectl get svc -A " +
+        "-l 'app.kubernetes.io/name=traefik-proxy' " +
+        "-o jsonpath='{.items[0].spec.clusterIP}' 2>/dev/null); " +
+        "[ -z \"$ip\" ] && ip=$(kubectl get svc traefik -n kube-system " +
+        "-o jsonpath='{.spec.clusterIP}' 2>/dev/null); " +
+        "echo \"$ip\" || true",
+        quiet=True, echo_off=True,
+    )).strip()
+    if ip == 'None':
+        return ''
+    return ip
+
+
+def _coredns_hairpin_yaml(domain, ip, workspace):
+    """Render the `coredns-custom` ConfigMap manifest as a string.
+
+    The `{{ .Name }}` token in the CoreDNS `template` plugin is a Go
+    template evaluated by CoreDNS at query time — it MUST reach the
+    cluster verbatim. It survives Starlark because this is a plain string
+    literal (no .format()) and the `%`-substitution below only consumes
+    the `%s` placeholders; braces pass through untouched.
+    """
+    slug = domain.replace('.', '-')
+    return """apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/managed-by: rdx
+  annotations:
+    rdx.io/workspace: "%s"
+data:
+  %s.server: |
+    %s:53 {
+        template IN A %s {
+            answer "{{ .Name }} 60 IN A %s"
+        }
+    }
+""" % (workspace, slug, domain, domain, ip)
+
+
+def _apply_coredns_hairpin(domain, workspace):
+    """Apply the CoreDNS hairpin ConfigMap for a loopback dev domain.
+
+    No-op (with a one-line note) for non-loopback domains, and a warning
+    — never a failure — when the ingress ClusterIP can't be found.
+    """
+    if not domain:
+        return
+    if not _domain_is_loopback(domain):
+        return
+    ip = _ingress_cluster_ip()
+    if not ip:
+        warn('[rdx] hairpin DNS: could not find the ingress controller ' +
+             'ClusterIP (looked for Traefik by label and kube-system/' +
+             'traefik). In-cluster calls to *.' + domain + ' will keep ' +
+             'hitting pod loopback. Skipping the coredns-custom override.')
+        return
+    print('[rdx] hairpin DNS: pointing *.' + domain + ' at ingress ' +
+          'ClusterIP ' + ip + ' via coredns-custom (kube-system).')
+    k8s_yaml(blob(_coredns_hairpin_yaml(domain, ip, workspace)))
+
+
 # Conventional ports for service types declared in `services`. Used by
 # port_forwards so a developer can `psql -h localhost -p 5432`, etc.
 # Legacy hardcoded ports — used as fallback when dsl-mappings.yaml
@@ -2072,6 +2215,13 @@ if __name__ == "__main__":
         _dl = (_cfg.get(_lib_key, {}) or {}) if _cfg else {}
         if 'domain' in _dl:
             _domain_value = _dl['domain']
+
+    # Hairpin DNS fix: when the workspace uses a loopback dev domain,
+    # override its in-cluster resolution so pods reaching peers by their
+    # public ingress hostname land on the Traefik ClusterIP instead of
+    # their own loopback. Tilt owns the ConfigMap's lifecycle (applied
+    # here, removed on `tilt down`). No-op for real domains.
+    _apply_coredns_hairpin(_domain_value, name)
 
     def _ingress_links(block, ingress_key='ingress', domain=''):
         """Extract clickable ingress links from a values block."""
