@@ -796,11 +796,33 @@ def rdx_app(
 
         sync_paths = live_update_paths if live_update_paths != None else defaults['live_update_paths']
 
+        # Cache flags differ by builder. The heroku/* lifecycle accepts a
+        # host bind-mount cache (format=bind;source=<dir>), giving a stable
+        # on-disk cache under /tmp that survives `pack` invocations.
+        #
+        # The Paketo lifecycle shipped in the BCI builder does NOT support
+        # bind caches the same way: it stats /cache inside an ephemeral
+        # exporter helper and bails with
+        #   [exporter] ERROR: failed to create volume cache:
+        #              stat /cache: no such file or directory
+        # so for any non-heroku builder we use a NAMED Docker volume
+        # (format=volume;name=<vol>). The Paketo lifecycle creates the
+        # volume on first build and reuses it on subsequent builds, giving
+        # the same persistent-cache speed-up the bind cache gives heroku.
         cache_dir = '/tmp/rdx-pack-cache-' + name
-        pack_args = ['pack', 'build', '$EXPECTED_REF',
-                     '--cache', '"type=build;format=bind;source=' + cache_dir + '"',
-                     '--cache', '"type=launch;format=bind;source=' + cache_dir + '-launch"',
-                     '--builder', builder]
+        cache_vol = 'rdx-pack-cache-' + name
+        pack_args = ['pack', 'build', '$EXPECTED_REF']
+        if _builder_kind == 'heroku':
+            pack_args.extend([
+                '--cache', '"type=build;format=bind;source=' + cache_dir + '"',
+                '--cache', '"type=launch;format=bind;source=' + cache_dir + '-launch"',
+            ])
+        else:
+            pack_args.extend([
+                '--cache', '"type=build;format=volume;name=' + cache_vol + '"',
+                '--cache', '"type=launch;format=volume;name=' + cache_vol + '-launch"',
+            ])
+        pack_args.extend(['--builder', builder])
         for bp in buildpacks:
             pack_args.extend(['--buildpack', bp])
         for k, v in additional_env.items():
