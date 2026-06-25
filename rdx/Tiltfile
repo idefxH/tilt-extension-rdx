@@ -88,6 +88,38 @@ BUILDER_IMAGES = {
     'bci': BCI_BUILDER,
 }
 
+# BCI builder live-update uid fix.
+#
+# The BCI builder builds as CNB_USER_ID=1001, but its run image
+# (ghcr.io/idefxh/base-bci-run) launches the container as uid 1002. The
+# CNB lifecycle exports the application layer (/workspace) owned by the
+# BUILD user (1001) with 0755 directories and 0644 files, so the LAUNCH
+# user (1002) has no write access under /workspace/src. Tilt's
+# live_update sync runs in the container as the pod's user, so its file
+# copy silently fails with EACCES — the synced file is never replaced,
+# the dev server (nodemon, the Procfile `dev` process) never observes a
+# change, and the app stays "updating" without ever reloading.
+#
+# The heroku builder uses a single uid for build AND launch, so the
+# launch user owns its own source files and live_update works — which is
+# why the bug only reproduces with builder='bci'.
+#
+# Fix: run the app pod as the builder's BUILD uid/gid so it owns the
+# source files it needs to overwrite. Verified locally: with
+# `--user 1001:1000` the in-container overwrite succeeds and nodemon
+# logs "restarting due to changes...". Applied via the library chart's
+# `podSecurityContext` (pod-scoped, so only the app pod is affected;
+# sub-charts keep their own security contexts).
+#
+# These track the BCI builder's CNB_USER_ID / CNB_GROUP_ID
+# (1001 / 1000 for builder-bci-base:16.0.x — confirmed via
+# `docker inspect ... CNB_USER_ID`). If a future BCI builder changes its
+# CNB user, override with RDX_BCI_RUNAS_UID / RDX_BCI_RUNAS_GID; set
+# RDX_BCI_RUNAS_UID=-1 to disable the override entirely (e.g. a builder
+# whose run image already matches its build uid).
+BCI_RUNAS_UID = 1001
+BCI_RUNAS_GID = 1000
+
 # Per-builder, per-language build-time env (pack --env) layered on top of
 # the language defaults' pack_build_env. heroku/nodejs decides dev-vs-prod
 # dependency install purely from NODE_ENV (set in LANGUAGE_DEFAULTS, honoured
@@ -744,6 +776,11 @@ def rdx_app(
     _workloads = _early_lib.get('workloads') or []
 
     # ─── Image strategy: pack build / pre-built image / helm-only ───
+    # Track the resolved builder family across the function. Set in the
+    # pack-build branch below; stays None for helm_only / image_ref
+    # deploys (where no builder runs). Read at the helm() step to decide
+    # the BCI live-update runAsUser fix.
+    _builder_kind = None
     if helm_only:
         pass
     elif image_ref:
@@ -2031,6 +2068,21 @@ if __name__ == "__main__":
     if image_ref:
         helm_set.append('image.repository=' + _img_repo)
         helm_set.append('image.tag=' + _img_tag)
+
+    # BCI builder live-update uid fix (see BCI_RUNAS_UID note up top).
+    # Run the app pod as the BCI builder's BUILD uid/gid so the launched
+    # container owns its /workspace source files and Tilt's live_update
+    # sync (which runs as the pod user) can overwrite them — otherwise the
+    # build-user-owned, launch-user-unwritable files block every reload.
+    # Scoped to the library subchart's podSecurityContext so only the app
+    # pod is touched; the heroku builder (single build/launch uid) and
+    # helm_only / image_ref deploys are left untouched.
+    if _builder_kind == 'bci':
+        _bci_uid = int(os.getenv('RDX_BCI_RUNAS_UID', str(BCI_RUNAS_UID)))
+        _bci_gid = int(os.getenv('RDX_BCI_RUNAS_GID', str(BCI_RUNAS_GID)))
+        if _bci_uid >= 0:
+            helm_set.append('%s.podSecurityContext.runAsUser=%d' % (_lib_key, _bci_uid))
+            helm_set.append('%s.podSecurityContext.runAsGroup=%d' % (_lib_key, _bci_gid))
 
     # Check for ingress hostname conflicts with other namespaces.
     # Two projects with the same ingress host (e.g. auth.localtest.me)

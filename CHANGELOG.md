@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Fixed
+
+- **BCI builder: live_update now reloads the app (was stuck "updating").**
+  With `builder='bci'`, editing a source file copied the file into the
+  container but the app never restarted — heroku worked fine. Root cause
+  (found via `docker inspect` + a real `pack build`): the BCI builder
+  builds as `CNB_USER_ID=1001`, but its run image launches the container
+  as uid `1002`. The CNB lifecycle exports `/workspace` owned by the
+  build user (1001) with `0755` dirs / `0644` files, so the launch user
+  (1002) cannot overwrite anything under `/workspace/src`. Tilt's
+  live_update sync runs as the pod user, so its copy silently fails with
+  `EACCES`, nodemon never sees a change, and the resource hangs in
+  "updating". The heroku builder uses one uid for build+launch, so its
+  sync works — hence the bug was BCI-only. `rdx_app()` now pins the app
+  pod's `runAsUser`/`runAsGroup` to the BCI builder's build uid/gid
+  (1001/1000) via the library chart's `podSecurityContext` so the
+  container owns the files live_update overwrites. Verified locally:
+  running the built image with `--user 1001:1000` makes the in-container
+  overwrite succeed and nodemon logs `restarting due to changes...`.
+  Override with `RDX_BCI_RUNAS_UID` / `RDX_BCI_RUNAS_GID`, or set
+  `RDX_BCI_RUNAS_UID=-1` to disable. Guarded by `test_bci_runas_uid.py`.
+
 ### Changed
 
 - **Operator webhook hooks are now catalog-driven.** The CNPG-specific
