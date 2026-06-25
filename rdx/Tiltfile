@@ -135,6 +135,72 @@ BUILDER_BUILD_ENV = {
     },
 }
 
+
+# Resolve the dynamic Paketo BP_*/BPE_* build-env for the BCI builder from
+# the rdx_app() convenience knobs. Layered ON TOP of BUILDER_BUILD_ENV (the
+# static per-language baseline) at `pack build --env` time.
+#
+# Pure function (no I/O, no globals) so tests/test_bci_paketo_env.py mirrors
+# it 1:1 — the Tiltfile is Starlark and can't be imported by pytest, so the
+# only way to test this construction is to keep a byte-aligned copy in the
+# test and assert on its output. Keep the two in lockstep.
+#
+# Every knob here maps to a documented Paketo build-time variable and is a
+# no-op on the heroku builder (heroku/* buildpacks don't read BP_*), so the
+# build block only calls this for builder='bci' and warns when a knob is set
+# for any other builder.
+def _resolve_bci_build_env(language, live_reload, reload_supported,
+                           node_version, bp_log_level, image_labels,
+                           runtime_cert_binding, debug, debug_port):
+    env = {}
+    # BP_LIVE_RELOAD_ENABLED=true makes the language buildpack install
+    # watchexec (present in builder-bci-base) and contribute a `reload`
+    # process. Only emit when the language actually supports it (see
+    # LANGUAGE_DEFAULTS['bci_reload']) — emitting it for go would bake a
+    # watchexec layer that nothing runs.
+    if live_reload and reload_supported:
+        env['BP_LIVE_RELOAD_ENABLED'] = 'true'
+    # BP_NODE_VERSION pins the Node runtime (node-engine buildpack). Paketo
+    # ALSO reads .node-version / .nvmrc / package.json#engines.node
+    # automatically; this is the explicit override. Node-only.
+    if node_version and language == 'nodejs':
+        env['BP_NODE_VERSION'] = str(node_version)
+    # BP_LOG_LEVEL=DEBUG turns on verbose buildpack logging — the first
+    # thing to reach for when a BCI build misbehaves.
+    if bp_log_level:
+        env['BP_LOG_LEVEL'] = str(bp_log_level)
+    # BP_IMAGE_LABELS: space-delimited key=value pairs applied as OCI labels
+    # by the image-labels buildpack. Sorted for a stable, testable string.
+    if image_labels:
+        env['BP_IMAGE_LABELS'] = ' '.join(
+            ['%s=%s' % (k, image_labels[k]) for k in sorted(image_labels)])
+    # Runtime cert binding is ON by default in Paketo's ca-certificates
+    # buildpack (a `ca-certificates` service binding is read at launch), so
+    # only emit the flag when the caller explicitly opts OUT with False.
+    if runtime_cert_binding == False:
+        env['BP_ENABLE_RUNTIME_CERT_BINDING'] = 'false'
+    # debug bakes a LAUNCH-time default via the environment-variables
+    # buildpack (BPE_DEFAULT_<NAME> sets the var only if unset at runtime),
+    # so the process starts its debug agent without a chart change. BPL_DEBUG_*
+    # is honoured by the JVM (bellsoft-liberica); for Node use
+    # additional_env={'BPE_DEFAULT_NODE_OPTIONS': '--inspect=0.0.0.0:9229'}.
+    if debug:
+        env['BPE_DEFAULT_BPL_DEBUG_ENABLED'] = 'true'
+        if debug_port:
+            env['BPE_DEFAULT_BPL_DEBUG_PORT'] = str(debug_port)
+    return env
+
+
+# Pick the pack --default-process for the BCI builder. When live_reload is
+# on and the language contributes a watchexec `reload` process, select it so
+# the container runs the app under watchexec instead of the plain web/dev
+# process. Returns None to mean "fall back to the Procfile-gated default".
+# Pure — mirrored in the test.
+def _bci_reload_default_process(live_reload, reload_supported):
+    if live_reload and reload_supported:
+        return 'reload'
+    return None
+
 # Per-language defaults. Live-update paths follow each buildpack's
 # expected workspace layout. Languages requiring a full rebuild on every
 # change (compiled) leave live_update_paths empty — Tilt rebuilds via
@@ -161,12 +227,20 @@ LANGUAGE_DEFAULTS = {
         # 'npm ci' instead of 'npm ci --omit=dev' and includes nodemon
         # (which is in devDependencies of the template package.json).
         'pack_build_env': {'NODE_ENV': 'development'},
+        # BCI/Paketo only: with BP_LIVE_RELOAD_ENABLED=true the nodejs
+        # buildpack (node-start) contributes a watchexec-wrapped `reload`
+        # process. Selectable as the default process so the heroku
+        # nodemon `dev:` hack isn't needed (see rdx_app live_reload=).
+        'bci_reload': True,
     },
     'python': {
         'buildpacks': ['heroku/python', 'heroku/procfile'],
         'live_update_paths': ['./src'],
         'live_update_install_trigger': ['./requirements.txt', './pyproject.toml', './Pipfile'],
         'live_update_install_cmd': 'cd /workspace && pip install -r requirements.txt 2>/dev/null || true',
+        # python-start contributes a watchexec `reload` process under
+        # BP_LIVE_RELOAD_ENABLED=true.
+        'bci_reload': True,
     },
     'java': {
         # heroku/java compiles via Maven/Gradle. heroku/procfile
@@ -177,6 +251,10 @@ LANGUAGE_DEFAULTS = {
         'live_update_paths': [],
         'live_update_install_trigger': [],
         'live_update_install_cmd': None,
+        # executable-jar / spring-boot / dist-zip contribute a watchexec
+        # `reload` process under BP_LIVE_RELOAD_ENABLED=true. Restarts the
+        # JVM (not the whole container) on a synced class/jar change.
+        'bci_reload': True,
     },
     'go': {
         # heroku/go + heroku/procfile. Go SDK is NOT in the CNB
@@ -192,6 +270,12 @@ LANGUAGE_DEFAULTS = {
         'live_update_paths': [],
         'live_update_install_trigger': [],
         'live_update_install_cmd': None,
+        # The BCI go-build buildpack (4.x in builder-bci-base:16.0.x) does
+        # NOT yet contribute a watchexec `reload` process
+        # (paketo-buildpacks/go-build#238 is still open), and Go is not in
+        # the run image, so live_reload= can't help here. Source changes
+        # fall back to a full layer-cached pack rebuild.
+        'bci_reload': False,
     },
 }
 
@@ -435,6 +519,13 @@ def rdx_app(
         builder_image=None,
         extra_buildpacks=[],
         additional_env={},
+        live_reload=False,
+        node_version=None,
+        bp_log_level=None,
+        image_labels=None,
+        runtime_cert_binding=None,
+        debug=False,
+        debug_port=None,
         live_update_paths=None,
         ui_labels=None,
         image_ref=None,
@@ -517,7 +608,56 @@ def rdx_app(
             language defaults; with builder='bci' they are the only
             buildpacks named explicitly (the builder detects the rest).
         additional_env (dict): build-time env vars passed via `pack build --env`.
-            E.g. {'BP_NODE_VERSION': '22'}.
+            E.g. {'BP_NODE_VERSION': '22'}. This is the raw escape hatch for
+            any Paketo BP_*/BPE_* knob not surfaced as a dedicated argument
+            (e.g. Go: BP_GO_TARGETS / BP_GO_BUILD_LDFLAGS; Java:
+            BP_JVM_VERSION / BP_MAVEN_BUILD_ARGUMENTS / BP_GRADLE_BUILD_ARGUMENTS;
+            Python: BP_CPYTHON_VERSION). The dedicated args below win over
+            additional_env on a key clash (curated defaults applied last).
+
+        Paketo / BCI builder knobs (builder='bci' only — these map to Paketo
+        BP_*/BPE_* build vars that the heroku/* buildpacks don't read. Setting
+        any of them with builder='heroku' prints one warning and is ignored;
+        the heroku path already live-reloads via the Procfile `dev:` process):
+
+        live_reload (bool): default False. When True, sets
+            BP_LIVE_RELOAD_ENABLED=true and selects the watchexec-wrapped
+            `reload` process as the container's default, so a Tilt
+            live_update file sync restarts just the app process (the
+            Paketo-native equivalent of the heroku nodemon `dev:` hack — no
+            Procfile `dev:` entry needed). Supported for nodejs/python/java;
+            ignored with a warning for go (its BCI buildpack contributes no
+            reload process and Go isn't in the run image). NOTE: watchexec
+            uses inotify by default, which can miss events on some
+            containerd/overlayfs setups — if reloads don't fire, the
+            default nodemon path (live_reload=False) is the safe fallback.
+        node_version (str): pin the Node runtime via BP_NODE_VERSION
+            (nodejs only). Paketo ALSO auto-reads .node-version, .nvmrc and
+            package.json#engines.node — prefer committing one of those; this
+            argument is the explicit override.
+        bp_log_level (str): BP_LOG_LEVEL for verbose buildpack logs, e.g.
+            'DEBUG'. First thing to reach for when a BCI build misbehaves.
+        image_labels (dict): OCI labels baked by the image-labels buildpack
+            via BP_IMAGE_LABELS (space-delimited key=value pairs).
+        runtime_cert_binding (bool): the ca-certificates buildpack reads a
+            `ca-certificates` service binding at LAUNCH by default (already
+            on). Pass False to disable (BP_ENABLE_RUNTIME_CERT_BINDING=false);
+            True/None leave the Paketo default untouched.
+        debug (bool): bake a launch-time debug default via the
+            environment-variables buildpack
+            (BPE_DEFAULT_BPL_DEBUG_ENABLED=true), so the runtime process
+            starts its debug agent. Honoured by the JVM (bellsoft-liberica);
+            for Node set additional_env={'BPE_DEFAULT_NODE_OPTIONS':
+            '--inspect=0.0.0.0:<port>'} instead. Forward the debug port
+            yourself (`kubectl port-forward` / a Tilt port_forward) — this
+            flag only configures the image, it does not open a port.
+        debug_port (int): paired with debug=True, sets
+            BPE_DEFAULT_BPL_DEBUG_PORT.
+
+        Monorepos: pass build_path='<subdir>' (it becomes `pack build
+        --path <subdir>`), which scopes the build context to that directory
+        for every builder — no separate BP_NODE_PROJECT_PATH needed.
+
         live_update_paths (list[str]): override default sync paths. Pass an
             empty list to disable live_update entirely.
         ui_labels (dict): map of resource name -> Tilt UI label. Defaults
@@ -814,6 +954,41 @@ def rdx_app(
         else:
             buildpacks = defaults['buildpacks'] + extra_buildpacks
 
+        # The Paketo BP_*/BPE_* convenience knobs only affect the BCI
+        # builder. Warn once (rather than baking no-op env layers) when any
+        # are set for a non-bci builder, then ignore them below.
+        _reload_supported = bool(defaults.get('bci_reload'))
+        if _builder_kind != 'bci':
+            _bci_only_knobs = []
+            if live_reload:
+                _bci_only_knobs.append('live_reload')
+            if node_version != None:
+                _bci_only_knobs.append('node_version')
+            if bp_log_level != None:
+                _bci_only_knobs.append('bp_log_level')
+            if image_labels != None:
+                _bci_only_knobs.append('image_labels')
+            if runtime_cert_binding != None:
+                _bci_only_knobs.append('runtime_cert_binding')
+            if debug:
+                _bci_only_knobs.append('debug')
+            if _bci_only_knobs:
+                print('rdx: warning — ' + ', '.join(_bci_only_knobs) +
+                      ' only affect the BCI builder (Paketo BP_*/BPE_* knobs); ' +
+                      'ignored for builder=' + repr(_builder_kind) + '. The ' +
+                      'heroku path already live-reloads via the Procfile `dev:` ' +
+                      'process (nodemon).')
+        elif live_reload and not _reload_supported:
+            # builder='bci' but this language's buildpack contributes no
+            # watchexec `reload` process (e.g. go-build). Don't bake a dead
+            # BP_LIVE_RELOAD layer or select a non-existent `reload` process
+            # (which would hard-fail pack build) — warn and fall back to the
+            # full layer-cached rebuild.
+            print('rdx: warning — live_reload=True ignored for language ' +
+                  repr(language) + ' on the BCI builder: its buildpack ' +
+                  'contributes no watchexec `reload` process. Source changes ' +
+                  'trigger a full (layer-cached) pack rebuild.')
+
         # Preflight: the BCI builder lives in a private registry, so `pack`
         # must be able to pull it (and its run image) with local ghcr.io
         # credentials. Warn — don't hard-fail — because credential helpers
@@ -864,28 +1039,60 @@ def rdx_app(
             pack_args.extend(['--buildpack', bp])
         for k, v in additional_env.items():
             pack_args.extend(['--env', '%s=%s' % (k, v)])
-        dev_proc = defaults.get('pack_default_process')
-        if dev_proc:
-            # Only pass --default-process if the Procfile actually declares
-            # that process name. Brownfield apps typically only have 'web:';
-            # forcing 'dev' would crash pack build with "tried to set dev to
-            # default but it doesn't exist".
-            _procfile_path = build_path + '/Procfile'
-            _has_dev_proc = False
-            if os.path.exists(_procfile_path):
-                _pf_content = str(read_file(_procfile_path))
-                for _pf_line in _pf_content.splitlines():
-                    if _pf_line.startswith(dev_proc + ':'):
-                        _has_dev_proc = True
-                        break
-            if _has_dev_proc:
-                pack_args.extend(['--default-process', dev_proc])
+        # Default process selection. With builder='bci' + live_reload, the
+        # watchexec `reload` process (contributed by BP_LIVE_RELOAD_ENABLED)
+        # IS the default — it's added by the buildpack, not the Procfile, so
+        # it needs no Procfile probe. Otherwise fall back to the language's
+        # Procfile-gated default (nodejs 'dev:' nodemon).
+        _reload_proc = None
+        if _builder_kind == 'bci':
+            _reload_proc = _bci_reload_default_process(live_reload, _reload_supported)
+        if _reload_proc:
+            pack_args.extend(['--default-process', _reload_proc])
+        else:
+            dev_proc = defaults.get('pack_default_process')
+            if dev_proc:
+                # Only pass --default-process if the Procfile actually declares
+                # that process name. Brownfield apps typically only have 'web:';
+                # forcing 'dev' would crash pack build with "tried to set dev to
+                # default but it doesn't exist".
+                _procfile_path = build_path + '/Procfile'
+                _has_dev_proc = False
+                if os.path.exists(_procfile_path):
+                    _pf_content = str(read_file(_procfile_path))
+                    for _pf_line in _pf_content.splitlines():
+                        if _pf_line.startswith(dev_proc + ':'):
+                            _has_dev_proc = True
+                            break
+                if _has_dev_proc:
+                    pack_args.extend(['--default-process', dev_proc])
         for k, v in (defaults.get('pack_build_env') or {}).items():
             pack_args.extend(['--env', '%s=%s' % (k, v)])
         # Builder-specific env (e.g. Paketo BP_* knobs for the BCI builder)
         # layered on top of the language defaults above.
         for k, v in (BUILDER_BUILD_ENV.get(_builder_kind, {}).get(language, {}) or {}).items():
             pack_args.extend(['--env', '%s=%s' % (k, v)])
+        # Dynamic Paketo BP_*/BPE_* knobs derived from rdx_app() arguments
+        # (live_reload, node_version, image_labels, debug, ...). BCI only;
+        # see _resolve_bci_build_env. Applied last so the curated knobs win
+        # on a key clash with additional_env / BUILDER_BUILD_ENV.
+        if _builder_kind == 'bci':
+            _bci_env = _resolve_bci_build_env(
+                language, live_reload, _reload_supported, node_version,
+                bp_log_level, image_labels, runtime_cert_binding,
+                debug, debug_port)
+            for k, v in _bci_env.items():
+                # custom_build runs this command through a shell, so a value
+                # with spaces (BP_IMAGE_LABELS is space-delimited key=value
+                # pairs) would split into extra tokens — `team=platform`
+                # becomes a stray positional arg to pack. Wrap such values in
+                # double quotes (matching the --cache quoting style above) so
+                # the shell keeps them as one argument. Keys/values must not
+                # themselves contain a double quote.
+                if ' ' in str(v):
+                    pack_args.extend(['--env', '%s="%s"' % (k, v)])
+                else:
+                    pack_args.extend(['--env', '%s=%s' % (k, v)])
         # Everything except --path is common to all workloads. Each
         # workload entry may carry its own build_path (the real source
         # dir, written into deploy/values.yaml by the rdx CLI); append

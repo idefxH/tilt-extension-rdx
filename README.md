@@ -85,6 +85,54 @@ extension in a repo lives in a subdirectory named after itself.
 | `java` | `paketo-buildpacks/java` | Full rebuild on any change |
 | `go` | `paketo-buildpacks/go` | Full rebuild on any change |
 
+## Builders: heroku (default) vs BCI / Paketo
+
+`rdx_app(builder=...)` selects the Cloud Native Buildpack builder:
+
+- `builder='heroku'` (default) — `heroku/builder:24` with `heroku/*`
+  buildpacks. Multi-arch, ~400 MB, the safe default.
+- `builder='bci'` — the SUSE BCI 16.0 builder
+  (`ghcr.io/idefxh/builder-bci-base`), which ships **Paketo** buildpacks.
+  Multi-arch (native arm64). Lives in a private registry, so run
+  `docker login ghcr.io` once (a preflight warns if it can't see ghcr
+  credentials; silence with `RDX_SKIP_GHCR_CHECK=1`).
+
+### Paketo build knobs (BCI only)
+
+These arguments map to documented Paketo `BP_*` / `BPE_*` build-time
+variables. They only affect `builder='bci'`; setting any of them with the
+heroku builder prints one warning and is ignored (the heroku path already
+live-reloads via the Procfile `dev:` nodemon process).
+
+```python
+rdx_app(
+    name='my-app',
+    language='nodejs',
+    builder='bci',
+    live_reload=True,            # BP_LIVE_RELOAD_ENABLED — watchexec reload
+    node_version='22',           # BP_NODE_VERSION (nodejs)
+    bp_log_level='DEBUG',        # BP_LOG_LEVEL — verbose buildpack logs
+    image_labels={'team': 'platform'},  # BP_IMAGE_LABELS (OCI labels)
+)
+```
+
+| Argument | Paketo var | Notes |
+|---|---|---|
+| `live_reload=True` | `BP_LIVE_RELOAD_ENABLED=true` | Builds a watchexec-wrapped `reload` process and runs it as the container default, so a Tilt file sync restarts just the app process — the Paketo-native replacement for the heroku nodemon `dev:` hack. nodejs/python/java only (go's buildpack contributes no reload process; ignored with a warning). watchexec uses inotify by default, which can miss events on some containerd/overlayfs setups — fall back to `live_reload=False` (nodemon) if reloads don't fire. |
+| `node_version='22'` | `BP_NODE_VERSION` | nodejs only. Paketo also auto-reads `.node-version`, `.nvmrc`, and `package.json#engines.node` — prefer committing one of those. |
+| `bp_log_level='DEBUG'` | `BP_LOG_LEVEL` | First thing to reach for when a BCI build misbehaves. |
+| `image_labels={...}` | `BP_IMAGE_LABELS` | OCI labels (space-delimited `key=value`, quoted for you). |
+| `runtime_cert_binding=False` | `BP_ENABLE_RUNTIME_CERT_BINDING=false` | Runtime cert binding is **on by default** in Paketo (a `ca-certificates` service binding is read at launch); pass `False` to disable. |
+| `debug=True`, `debug_port=5005` | `BPE_DEFAULT_BPL_DEBUG_ENABLED` / `_PORT` | Bakes a launch-time debug default via the environment-variables buildpack (honoured by the JVM). For Node, set `additional_env={'BPE_DEFAULT_NODE_OPTIONS': '--inspect=0.0.0.0:9229'}`. This configures the image only — forward the port yourself. |
+
+For any Paketo knob without a dedicated argument (e.g. Go `BP_GO_TARGETS` /
+`BP_GO_BUILD_LDFLAGS`, Java `BP_JVM_VERSION` / `BP_MAVEN_BUILD_ARGUMENTS`,
+Python `BP_CPYTHON_VERSION`), use the raw `additional_env={...}` escape
+hatch. Dedicated arguments win over `additional_env` on a key clash.
+
+Monorepos need no Paketo-specific flag: `build_path='<subdir>'` already
+scopes the build context (`pack build --path <subdir>`) for every builder.
+
 ## Brownfield support
 
 For existing apps with a pre-built container image (no pack build):
@@ -160,6 +208,8 @@ local port:
 |---|---|
 | `RDX_DEFAULT_REGISTRY` | Calls `default_registry(...)` at extension load. Use for CI / local-mirror / air-gapped setups (e.g. `localhost:5000` for the e2e kind-mirror). |
 | `RDX_SKIP_PULLSECRET_MIRROR=1` | Skip the `default → <ns>` mirror of `Secret/application-collection`. Set when an operator (kubernetes-reflector, External Secrets) distributes the pull secret instead. |
+| `RDX_SKIP_GHCR_CHECK=1` | Skip the `builder='bci'` preflight that warns when no `ghcr.io` entry is found in `~/.docker/config.json` (credential helpers store auth elsewhere). |
+| `RDX_BCI_RUNAS_UID` / `RDX_BCI_RUNAS_GID` | Override the `builder='bci'` live-update `runAsUser`/`runAsGroup` (defaults 1001/1000, the builder's CNB build uid/gid). Set `RDX_BCI_RUNAS_UID=-1` to disable the override. |
 
 ## RDX-SUSE buildpacks (future)
 

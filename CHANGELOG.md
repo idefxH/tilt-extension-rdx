@@ -2,7 +2,53 @@
 
 ## Unreleased
 
+### Added
+
+- **BCI builder: Paketo build-time knobs surfaced as `rdx_app()` arguments.**
+  The `builder='bci'` path (which ships Paketo buildpacks) now exposes the
+  Paketo features the heroku builder can't, each as a dedicated argument
+  that maps to a documented `BP_*` / `BPE_*` `pack build --env` flag:
+  - `live_reload=True` → `BP_LIVE_RELOAD_ENABLED=true`, and selects the
+    watchexec-wrapped `reload` process as the container default. This is
+    the Paketo-native replacement for the heroku nodemon `dev:` hack — a
+    Tilt file sync restarts just the app process. Supported for
+    nodejs/python/java (the BCI builder bundles the `watchexec` buildpack
+    for those); ignored with a warning for go (its `go-build` buildpack
+    contributes no reload process, and Go isn't in the run image). Opt-in,
+    not the default: watchexec uses inotify, which can miss events on some
+    containerd/overlayfs setups, so the verified nodemon path stays the
+    default.
+  - `node_version=` → `BP_NODE_VERSION` (nodejs). Paketo also auto-reads
+    `.node-version` / `.nvmrc` / `package.json#engines.node`.
+  - `bp_log_level=` → `BP_LOG_LEVEL` (e.g. `'DEBUG'`).
+  - `image_labels={...}` → `BP_IMAGE_LABELS` (OCI labels). The
+    space-delimited value is now shell-quoted in the emitted `pack`
+    command (see Fixed) so a multi-label value doesn't split into stray
+    positional args.
+  - `runtime_cert_binding=False` → `BP_ENABLE_RUNTIME_CERT_BINDING=false`
+    (runtime cert binding is on by default in Paketo, so this is opt-OUT).
+  - `debug=True` / `debug_port=` → `BPE_DEFAULT_BPL_DEBUG_ENABLED` /
+    `_PORT`, baking a launch-time debug default via the
+    environment-variables buildpack (honoured by the JVM).
+
+  All knobs are no-ops on the heroku builder, so setting one with
+  `builder='heroku'` prints a single warning and is ignored rather than
+  baking a dead env layer. Dedicated arguments win over the raw
+  `additional_env={...}` escape hatch on a key clash. Monorepo subdirs
+  need no new flag — the existing `build_path=` already scopes the build
+  context via `pack build --path`. Guarded by `test_bci_paketo_env.py`
+  (which extracts and execs the real Tiltfile helpers so the tests can't
+  drift from the code) and verified end-to-end with
+  `tilt alpha tiltfile-result` against the example app.
+
 ### Fixed
+
+- **BCI builder: `BP_IMAGE_LABELS` (and any space-bearing `pack --env`
+  value) is now shell-quoted.** `custom_build` runs the `pack` command
+  through a shell, so a `--env BP_IMAGE_LABELS=a=1 b=2` token split `b=2`
+  off into a stray positional argument to `pack`. Space-bearing values are
+  now wrapped in double quotes, matching the existing `--cache` quoting.
+
 
 - **BCI builder: live_update now reloads the app (was stuck "updating").**
   With `builder='bci'`, editing a source file copied the file into the
