@@ -154,8 +154,8 @@ def _resolve_bci_build_env(language, live_reload, reload_supported,
                            runtime_cert_binding, debug, debug_port):
     env = {}
     # BP_LIVE_RELOAD_ENABLED=true makes the language buildpack install
-    # watchexec (present in builder-bci-base) and contribute a `reload`
-    # process. Only emit when the language actually supports it (see
+    # watchexec (present in builder-bci-base) and wrap its `web` process in
+    # it. Only emit when the language actually supports it (see
     # LANGUAGE_DEFAULTS['bci_reload']) — emitting it for go would bake a
     # watchexec layer that nothing runs.
     if live_reload and reload_supported:
@@ -191,15 +191,53 @@ def _resolve_bci_build_env(language, live_reload, reload_supported,
     return env
 
 
-# Pick the pack --default-process for the BCI builder. When live_reload is
-# on and the language contributes a watchexec `reload` process, select it so
-# the container runs the app under watchexec instead of the plain web/dev
-# process. Returns None to mean "fall back to the Procfile-gated default".
-# Pure — mirrored in the test.
+# Pick the pack --default-process for the BCI builder under live_reload.
+#
+# IMPORTANT: there is no `reload` process. With BP_LIVE_RELOAD_ENABLED=true
+# the Paketo language buildpack (e.g. npm-start) wraps its OWN default `web`
+# process in watchexec — verified from a real BCI build log:
+#   web (default): watchexec --restart --watch /workspace ... -- sh start.sh
+#   no-reload:     sh start.sh
+# So the watchexec-wrapped process is named `web`, not `reload`. Selecting a
+# non-existent `reload` hard-fails the build with
+#   ERROR: tried to set reload to default but it doesn't exist
+# Hence we select `web`. (The Procfile, if present, would clobber this `web`
+# with a plain command — that's handled separately by excluding the Procfile
+# from the build context; see _bci_procfile_exclude_action.)
+#
+# Returns None to mean "fall back to the Procfile-gated default". Pure —
+# mirrored in the test.
 def _bci_reload_default_process(live_reload, reload_supported):
     if live_reload and reload_supported:
-        return 'reload'
+        return 'web'
     return None
+
+
+# Decide how to stop the heroku/procfile-style process types from clobbering
+# Paketo's watchexec-wrapped `web` process when live_reload is on for the BCI
+# builder. The procfile buildpack runs AFTER npm-start in the BCI builder's
+# detection order, and a `web:` Procfile entry OVERWRITES npm-start's
+# watchexec `web` with a plain command — killing live reload (confirmed from
+# a real build log). The fix is to exclude the Procfile from the build
+# context (a pack project descriptor with `exclude = ["Procfile"]`), so the
+# procfile buildpack detects nothing and npm-start's watchexec `web` survives.
+#
+# Returns:
+#   'exclude' -> write/pass a project descriptor that excludes the Procfile
+#   'warn'    -> a user project.toml already exists; we won't clobber it, so
+#                warn that live reload won't take effect until they exclude
+#                the Procfile themselves
+#   'none'    -> nothing to do (not bci+live_reload, or no Procfile present)
+# Pure — mirrored in the test.
+def _bci_procfile_exclude_action(builder_kind, live_reload, reload_supported,
+                                 procfile_exists, project_toml_exists):
+    if builder_kind != 'bci' or not live_reload or not reload_supported:
+        return 'none'
+    if not procfile_exists:
+        return 'none'
+    if project_toml_exists:
+        return 'warn'
+    return 'exclude'
 
 # Per-language defaults. Live-update paths follow each buildpack's
 # expected workspace layout. Languages requiring a full rebuild on every
@@ -227,10 +265,11 @@ LANGUAGE_DEFAULTS = {
         # 'npm ci' instead of 'npm ci --omit=dev' and includes nodemon
         # (which is in devDependencies of the template package.json).
         'pack_build_env': {'NODE_ENV': 'development'},
-        # BCI/Paketo only: with BP_LIVE_RELOAD_ENABLED=true the nodejs
-        # buildpack (node-start) contributes a watchexec-wrapped `reload`
-        # process. Selectable as the default process so the heroku
-        # nodemon `dev:` hack isn't needed (see rdx_app live_reload=).
+        # BCI/Paketo only: with BP_LIVE_RELOAD_ENABLED=true npm-start wraps
+        # its own `web` process in watchexec, so the heroku nodemon `dev:`
+        # hack isn't needed (see rdx_app live_reload=). Requires an npm
+        # `start` script (or a Procfile `web:` — but the Procfile is excluded
+        # under live_reload so the watchexec `web` isn't clobbered).
         'bci_reload': True,
     },
     'python': {
@@ -238,7 +277,7 @@ LANGUAGE_DEFAULTS = {
         'live_update_paths': ['./src'],
         'live_update_install_trigger': ['./requirements.txt', './pyproject.toml', './Pipfile'],
         'live_update_install_cmd': 'cd /workspace && pip install -r requirements.txt 2>/dev/null || true',
-        # python-start contributes a watchexec `reload` process under
+        # python-start wraps its `web` process in watchexec under
         # BP_LIVE_RELOAD_ENABLED=true.
         'bci_reload': True,
     },
@@ -251,9 +290,9 @@ LANGUAGE_DEFAULTS = {
         'live_update_paths': [],
         'live_update_install_trigger': [],
         'live_update_install_cmd': None,
-        # executable-jar / spring-boot / dist-zip contribute a watchexec
-        # `reload` process under BP_LIVE_RELOAD_ENABLED=true. Restarts the
-        # JVM (not the whole container) on a synced class/jar change.
+        # executable-jar / spring-boot / dist-zip wrap their `web` process in
+        # watchexec under BP_LIVE_RELOAD_ENABLED=true. Restarts the JVM (not
+        # the whole container) on a synced class/jar change.
         'bci_reload': True,
     },
     'go': {
@@ -271,7 +310,7 @@ LANGUAGE_DEFAULTS = {
         'live_update_install_trigger': [],
         'live_update_install_cmd': None,
         # The BCI go-build buildpack (4.x in builder-bci-base:16.0.x) does
-        # NOT yet contribute a watchexec `reload` process
+        # NOT support BP_LIVE_RELOAD_ENABLED / watchexec wrapping
         # (paketo-buildpacks/go-build#238 is still open), and Go is not in
         # the run image, so live_reload= can't help here. Source changes
         # fall back to a full layer-cached pack rebuild.
@@ -621,16 +660,23 @@ def rdx_app(
         the heroku path already live-reloads via the Procfile `dev:` process):
 
         live_reload (bool): default False. When True, sets
-            BP_LIVE_RELOAD_ENABLED=true and selects the watchexec-wrapped
-            `reload` process as the container's default, so a Tilt
-            live_update file sync restarts just the app process (the
-            Paketo-native equivalent of the heroku nodemon `dev:` hack — no
-            Procfile `dev:` entry needed). Supported for nodejs/python/java;
-            ignored with a warning for go (its BCI buildpack contributes no
-            reload process and Go isn't in the run image). NOTE: watchexec
-            uses inotify by default, which can miss events on some
-            containerd/overlayfs setups — if reloads don't fire, the
-            default nodemon path (live_reload=False) is the safe fallback.
+            BP_LIVE_RELOAD_ENABLED=true (Paketo wraps the buildpack's own
+            `web` process in watchexec), selects `--default-process web`, and
+            EXCLUDES the project's Procfile from the build context via a pack
+            project descriptor — otherwise the procfile buildpack's `web:`
+            entry overwrites the watchexec-wrapped `web` and reload silently
+            stops working. A Tilt live_update file sync then restarts just
+            the app process (the Paketo-native equivalent of the heroku
+            nodemon `dev:` hack). Requires an npm `start` script (Node) /
+            equivalent native entrypoint, since the Procfile is excluded.
+            Supported for nodejs/python/java; ignored with a warning for go
+            (its BCI buildpack doesn't support watchexec reload and Go isn't
+            in the run image). If the project ships its own project.toml, the
+            Procfile is left in place (we don't clobber a user descriptor)
+            and a warning explains how to exclude it. NOTE: watchexec uses
+            inotify by default, which can miss events on some
+            containerd/overlayfs setups — if reloads don't fire, the default
+            nodemon path (live_reload=False) is the safe fallback.
         node_version (str): pin the Node runtime via BP_NODE_VERSION
             (nodejs only). Paketo ALSO auto-reads .node-version, .nvmrc and
             package.json#engines.node — prefer committing one of those; this
@@ -1040,10 +1086,12 @@ def rdx_app(
         for k, v in additional_env.items():
             pack_args.extend(['--env', '%s=%s' % (k, v)])
         # Default process selection. With builder='bci' + live_reload, the
-        # watchexec `reload` process (contributed by BP_LIVE_RELOAD_ENABLED)
-        # IS the default — it's added by the buildpack, not the Procfile, so
-        # it needs no Procfile probe. Otherwise fall back to the language's
-        # Procfile-gated default (nodejs 'dev:' nodemon).
+        # watchexec-wrapped process is the language buildpack's own `web`
+        # (npm-start et al. wrap `web` when BP_LIVE_RELOAD_ENABLED=true), so
+        # we select `web`. There is NO `reload` process — selecting one would
+        # hard-fail the build. The Procfile (which would clobber `web` with a
+        # plain command) is excluded from the build context below. Otherwise
+        # fall back to the language's Procfile-gated default ('dev:' nodemon).
         _reload_proc = None
         if _builder_kind == 'bci':
             _reload_proc = _bci_reload_default_process(live_reload, _reload_supported)
@@ -1093,6 +1141,46 @@ def rdx_app(
                     pack_args.extend(['--env', '%s="%s"' % (k, v)])
                 else:
                     pack_args.extend(['--env', '%s=%s' % (k, v)])
+        # Procfile exclusion for builder='bci' + live_reload. The BCI
+        # builder's procfile buildpack runs after npm-start and a `web:`
+        # Procfile entry OVERWRITES npm-start's watchexec-wrapped `web` with
+        # a plain command — killing live reload. Exclude the Procfile from
+        # the build context via a pack project descriptor so the procfile
+        # buildpack detects nothing and the watchexec `web` survives. Skip
+        # (with a warning) when the project already ships its own
+        # project.toml, so we never clobber a user descriptor.
+        _excl_action = _bci_procfile_exclude_action(
+            _builder_kind, live_reload, _reload_supported,
+            os.path.exists(build_path + '/Procfile'),
+            os.path.exists(build_path + '/project.toml'))
+        if _excl_action == 'exclude':
+            _descriptor_path = '/tmp/rdx-pack-descriptor-' + name + '.toml'
+            _descriptor_content = '\n'.join([
+                '# Generated by tilt-extension-rdx (builder=bci, live_reload=True).',
+                '# Excludes the Procfile so heroku/procfile-style process types',
+                "# don't overwrite Paketo npm-start's watchexec-wrapped `web`.",
+                '[_]',
+                'schema-version = "0.2"',
+                '',
+                '[io.buildpacks]',
+                'exclude = ["Procfile"]',
+                '',
+            ])
+            # Write at eval time (re-run on every Tiltfile reload — idempotent)
+            # so the descriptor exists when custom_build later invokes pack.
+            local(
+                "cat > '" + _descriptor_path + "' <<'RDXEOF'\n" +
+                _descriptor_content + "RDXEOF\n",
+                quiet=True, echo_off=True)
+            pack_args.extend(['--descriptor', _descriptor_path])
+        elif _excl_action == 'warn':
+            print('rdx: warning — live_reload=True with builder=bci, but ' +
+                  build_path + '/project.toml exists, so the Procfile is NOT ' +
+                  'excluded from the build. The procfile buildpack will ' +
+                  "overwrite Paketo's watchexec-wrapped `web` process and live " +
+                  'reload will not take effect. Add `exclude = ["Procfile"]` ' +
+                  'under [io.buildpacks] in your project.toml to enable it.')
+
         # Everything except --path is common to all workloads. Each
         # workload entry may carry its own build_path (the real source
         # dir, written into deploy/values.yaml by the rdx CLI); append

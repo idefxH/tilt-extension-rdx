@@ -47,7 +47,8 @@ def _load_helpers():
     """Exec the two pure helpers out of rdx/Tiltfile so we test the real code."""
     src = open(_TILTFILE).read()
     tree = ast.parse(src)
-    wanted = ('_resolve_bci_build_env', '_bci_reload_default_process')
+    wanted = ('_resolve_bci_build_env', '_bci_reload_default_process',
+              '_bci_procfile_exclude_action')
     ns = {}
     found = set()
     for node in tree.body:
@@ -58,10 +59,13 @@ def _load_helpers():
     missing = set(wanted) - found
     if missing:
         raise AssertionError('helpers not found in Tiltfile: %s' % missing)
-    return ns['_resolve_bci_build_env'], ns['_bci_reload_default_process']
+    return ns
 
 
-_resolve_bci_build_env, _bci_reload_default_process = _load_helpers()
+_HELPERS = _load_helpers()
+_resolve_bci_build_env = _HELPERS['_resolve_bci_build_env']
+_bci_reload_default_process = _HELPERS['_bci_reload_default_process']
+_bci_procfile_exclude_action = _HELPERS['_bci_procfile_exclude_action']
 
 
 def _check(cond, msg):
@@ -143,13 +147,37 @@ def test_debug_bakes_launch_default():
 
 
 def test_reload_default_process():
-    _check(_bci_reload_default_process(True, True) == 'reload',
-           'live_reload + supported -> reload')
+    # There is NO `reload` process — npm-start wraps its own `web` in
+    # watchexec, so we must select `web` (selecting `reload` hard-fails the
+    # build with "tried to set reload to default but it doesn't exist").
+    _check(_bci_reload_default_process(True, True) == 'web',
+           'live_reload + supported -> web (NOT reload)')
+    _check(_bci_reload_default_process(True, True) != 'reload',
+           'must never select the non-existent reload process')
     _check(_bci_reload_default_process(True, False) == None,
            'live_reload + unsupported -> None (fall back)')
     _check(_bci_reload_default_process(False, True) == None,
            'no live_reload -> None')
     _check(_bci_reload_default_process(False, False) == None, 'both off -> None')
+
+
+def test_procfile_exclude_action():
+    # bci + live_reload + supported + Procfile + no project.toml -> exclude it
+    _check(_bci_procfile_exclude_action('bci', True, True, True, False) == 'exclude',
+           'Procfile present, no project.toml -> exclude')
+    # ...but a user project.toml exists -> warn, don't clobber it
+    _check(_bci_procfile_exclude_action('bci', True, True, True, True) == 'warn',
+           'user project.toml present -> warn (no clobber)')
+    # no Procfile -> nothing to exclude
+    _check(_bci_procfile_exclude_action('bci', True, True, False, False) == 'none',
+           'no Procfile -> none')
+    # not live_reload, or heroku, or unsupported language -> none
+    _check(_bci_procfile_exclude_action('bci', False, True, True, False) == 'none',
+           'no live_reload -> none')
+    _check(_bci_procfile_exclude_action('heroku', True, True, True, False) == 'none',
+           'heroku -> none')
+    _check(_bci_procfile_exclude_action('bci', True, False, True, False) == 'none',
+           'go (unsupported) -> none')
 
 
 # ── Inline-branch mirrors (kept byte-aligned with the build block) ──────────
@@ -202,9 +230,9 @@ def test_bci_only_knob_warning_gate():
 
 
 def test_default_process_selection():
-    # bci + live_reload + supported -> watchexec reload process
-    _check(_select_default_process('bci', True, True, 'dev', True) == 'reload',
-           'bci live_reload picks reload')
+    # bci + live_reload + supported -> watchexec-wrapped `web` (NOT reload)
+    _check(_select_default_process('bci', True, True, 'dev', True) == 'web',
+           'bci live_reload picks web')
     # bci + live_reload + unsupported (go) -> Procfile default if present
     _check(_select_default_process('bci', True, False, None, False) == None,
            'go w/ no procfile default -> None')
@@ -213,9 +241,9 @@ def test_default_process_selection():
            'bci default keeps the nodemon dev process')
     _check(_select_default_process('bci', False, True, 'dev', False) == None,
            'no dev: in Procfile -> no override (brownfield web-only)')
-    # heroku never selects reload regardless of live_reload
+    # heroku never picks the watchexec web; uses Procfile dev
     _check(_select_default_process('heroku', True, True, 'dev', True) == 'dev',
-           'heroku ignores reload, uses Procfile dev')
+           'heroku ignores live_reload, uses Procfile dev')
 
 
 def _emit_env_flag(k, v):
@@ -265,6 +293,7 @@ if __name__ == '__main__':
         test_runtime_cert_binding_opt_out_only,
         test_debug_bakes_launch_default,
         test_reload_default_process,
+        test_procfile_exclude_action,
         test_bci_only_knob_warning_gate,
         test_default_process_selection,
         test_image_labels_shell_quoted,

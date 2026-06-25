@@ -8,16 +8,19 @@
   The `builder='bci'` path (which ships Paketo buildpacks) now exposes the
   Paketo features the heroku builder can't, each as a dedicated argument
   that maps to a documented `BP_*` / `BPE_*` `pack build --env` flag:
-  - `live_reload=True` → `BP_LIVE_RELOAD_ENABLED=true`, and selects the
-    watchexec-wrapped `reload` process as the container default. This is
-    the Paketo-native replacement for the heroku nodemon `dev:` hack — a
-    Tilt file sync restarts just the app process. Supported for
-    nodejs/python/java (the BCI builder bundles the `watchexec` buildpack
-    for those); ignored with a warning for go (its `go-build` buildpack
-    contributes no reload process, and Go isn't in the run image). Opt-in,
-    not the default: watchexec uses inotify, which can miss events on some
-    containerd/overlayfs setups, so the verified nodemon path stays the
-    default.
+  - `live_reload=True` → `BP_LIVE_RELOAD_ENABLED=true`. Paketo wraps the
+    buildpack's own `web` process in watchexec, so the extension selects
+    `--default-process web` and excludes the Procfile from the build
+    context (a `web:` Procfile entry runs after npm-start in the BCI
+    builder and would overwrite the watchexec-wrapped `web`, silently
+    breaking reload). This is the Paketo-native replacement for the heroku
+    nodemon `dev:` hack — a Tilt file sync restarts just the app process.
+    Supported for nodejs/python/java (the BCI builder bundles the
+    `watchexec` buildpack for those); ignored with a warning for go (its
+    `go-build` buildpack has no watchexec support, and Go isn't in the run
+    image). Opt-in, not the default: watchexec uses inotify, which can miss
+    events on some containerd/overlayfs setups, so the verified nodemon
+    path stays the default.
   - `node_version=` → `BP_NODE_VERSION` (nodejs). Paketo also auto-reads
     `.node-version` / `.nvmrc` / `package.json#engines.node`.
   - `bp_log_level=` → `BP_LOG_LEVEL` (e.g. `'DEBUG'`).
@@ -42,6 +45,19 @@
   `tilt alpha tiltfile-result` against the example app.
 
 ### Fixed
+
+- **BCI builder: `live_reload=True` no longer hard-fails the build.** The
+  first cut selected `--default-process reload`, but there is no `reload`
+  process: with `BP_LIVE_RELOAD_ENABLED=true` the Paketo language buildpack
+  wraps its OWN `web` process in watchexec (`web (default): watchexec
+  --restart … -- sh start.sh`), so `pack` failed with `tried to set reload
+  to default but it doesn't exist`. Now the extension selects
+  `--default-process web` AND excludes the Procfile from the build context
+  (via a generated `project.toml` with `exclude = ["Procfile"]`) — the
+  BCI builder's procfile buildpack runs after npm-start and a `web:`
+  Procfile entry would otherwise overwrite the watchexec-wrapped `web` with
+  a plain command, silently disabling reload. Projects that ship their own
+  `project.toml` are left untouched (warned, not clobbered).
 
 - **BCI builder: `BP_IMAGE_LABELS` (and any space-bearing `pack --env`
   value) is now shell-quoted.** `custom_build` runs the `pack` command
