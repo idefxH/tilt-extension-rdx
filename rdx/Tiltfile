@@ -888,6 +888,14 @@ def rdx_app(
             ' > /dev/null 2>&1 && echo yes || echo no',
             quiet=True, echo_off=True)).strip() == 'yes'
 
+    # One concise banner on the cold path so the bootstrap work below reads
+    # as intentional progress rather than a wall of shell output (issue #7
+    # L1). Steady-state reloads — where _bootstrap_done is true and the
+    # idempotent steps below are skipped/silent — stay quiet.
+    if not _bootstrap_done:
+        print('rdx: first-run bootstrap for namespace ' + namespace +
+              ' (namespace + pull-secret + charts)…')
+
     # Pre-create the namespace idempotently. Tilt invokes `helm template`
     # (not `helm install --create-namespace`) so the namespace must exist
     # before k8s_yaml applies the rendered manifests. `kubectl create
@@ -2295,7 +2303,9 @@ if __name__ == "__main__":
         # Fast-path: lock fresh AND charts/ populated -> skip update.
         '    if [ -f "$sub/Chart.lock" ] && [ "$sub/Chart.lock" -nt "$sub/Chart.yaml" ] && ' +
         '       [ -d "$sub/charts" ] && [ -n "$(ls -A "$sub/charts" 2>/dev/null)" ]; then ' +
-        '      echo "[rdx] $sub deps up to date, skipping helm dep update"; ' +
+        # Fast-path is the steady-state case (hit on every warm reload).
+        # Stay silent here (issue #7 L1) so a normal reload prints nothing;
+        # only genuine dep-update work in the parallel pass below echoes.
         '      python3 "' + align_script_path + '" "$sub"; ' +
         '    else ' +
         '      printf "%s\\n" "$sub" >> "$_need"; ' +
