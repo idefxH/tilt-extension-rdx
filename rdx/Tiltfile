@@ -791,15 +791,36 @@ def rdx_app(
     # whether it understands the `namespace` subcommand (rdx-cli 0.1.47+,
     # which owns canonical namespace expansion), so we don't pay for
     # repeated blocking probes on every Tiltfile re-eval.
+    # One shell round-trip does three things that used to be two separate
+    # forks every reload (issue #7 #2+#3, H3): probe rdx presence + the
+    # `namespace` subcommand, then expand the namespace — with the
+    # expansion cached to /tmp so steady-state reloads skip the
+    # `rdx namespace expand` fork entirely (issue #7 M2). The cache is
+    # keyed on the project directory (cksum of $PWD, so co-located
+    # projects don't collide) and invalidated whenever .rdx/project.yaml
+    # is newer than the cache file — that file plus $USER (process-stable)
+    # are the only inputs the expansion depends on. Emits three
+    # space-separated fields: present, can_expand, namespace (a k8s
+    # namespace is a DNS label, so it never contains a space).
     _rdx_probe = str(local(
-        'if command -v rdx > /dev/null 2>&1; then ' +
-        'if rdx namespace --help > /dev/null 2>&1; then echo "yes yes"; ' +
-        'else echo "yes no"; fi; else echo "no no"; fi',
+        'if command -v rdx > /dev/null 2>&1; then _p=yes; else _p=no; fi; ' +
+        'if [ "$_p" = yes ] && rdx namespace --help > /dev/null 2>&1; ' +
+        'then _c=yes; else _c=no; fi; ' +
+        '_ns=""; ' +
+        'if [ "$_c" = yes ]; then ' +
+        '  _ck=/tmp/rdx-nsexpand-$(pwd | cksum | cut -d" " -f1); ' +
+        '  if [ -f "$_ck" ] && [ "$_ck" -nt .rdx/project.yaml ]; then ' +
+        '    _ns=$(cat "$_ck"); ' +
+        '  else ' +
+        '    _ns=$(rdx namespace expand) && printf "%s" "$_ns" > "$_ck"; ' +
+        '  fi; ' +
+        'fi; ' +
+        'printf "%s %s %s\\n" "$_p" "$_c" "$_ns"',
         quiet=True, echo_off=True)).strip().split()
     _rdx_present = len(_rdx_probe) > 0 and _rdx_probe[0] == 'yes'
     _rdx_can_expand = len(_rdx_probe) > 1 and _rdx_probe[1] == 'yes'
     if _rdx_can_expand:
-        namespace = str(local('rdx namespace expand', quiet=True, echo_off=True)).strip()
+        namespace = _rdx_probe[2] if len(_rdx_probe) > 2 else ''
         if not namespace:
             fail('rdx_app: `rdx namespace expand` returned empty output. Check `.rdx/project.yaml`.')
     else:
