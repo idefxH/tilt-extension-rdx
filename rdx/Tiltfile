@@ -617,7 +617,7 @@ def rdx_app(
         builder_image=None,
         extra_buildpacks=[],
         additional_env={},
-        live_reload=False,
+        live_reload=None,
         node_version=None,
         bp_log_level=None,
         image_labels=None,
@@ -723,7 +723,11 @@ def rdx_app(
         any of them with builder='heroku' prints one warning and is ignored;
         the heroku path already live-reloads via the Procfile `dev:` process):
 
-        live_reload (bool): default False. When True, sets
+        live_reload (bool|None): default None — ON for the BCI builder on
+            languages whose Paketo buildpack supports watchexec
+            (nodejs/python/java), OFF otherwise (heroku reloads via the
+            Procfile `dev:` process; go rebuilds via pack). Pass True/False
+            to override. When on, sets
             BP_LIVE_RELOAD_ENABLED=true (Paketo wraps the buildpack's own
             `web` process in watchexec), selects `--default-process web`, and
             EXCLUDES the project's Procfile from the build context via a pack
@@ -1148,6 +1152,12 @@ def rdx_app(
         # builder. Warn once (rather than baking no-op env layers) when any
         # are set for a non-bci builder, then ignore them below.
         _reload_supported = bool(defaults.get('bci_reload'))
+        # Default live_reload ON for the BCI builder (its Paketo buildpacks
+        # ship watchexec) on languages that support it; OFF otherwise — the
+        # heroku path reloads via the Procfile `dev:` process and compiled
+        # languages rebuild via pack. An explicit live_reload= always wins.
+        if live_reload == None:
+            live_reload = (_builder_kind == 'bci' and _reload_supported)
         if _builder_kind != 'bci':
             _bci_only_knobs = []
             if live_reload:
