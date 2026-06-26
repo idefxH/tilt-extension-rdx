@@ -810,9 +810,14 @@ def rdx_app(
     # keyed on the project directory (cksum of $PWD, so co-located
     # projects don't collide) and invalidated whenever .rdx/project.yaml
     # is newer than the cache file — that file plus $USER (process-stable)
-    # are the only inputs the expansion depends on. Emits three
-    # space-separated fields: present, can_expand, namespace (a k8s
-    # namespace is a DNS label, so it never contains a space).
+    # are the only inputs the expansion depends on. The same shell also
+    # folds in the bootstrap-liveness probe (issue #7 #4, H3): when the
+    # namespace is known it checks the sentinel + `kubectl get namespace`
+    # in-line, so the common path no longer pays a separate cluster
+    # round-trip on every reload to compute _bootstrap_done below. Emits
+    # four newline-separated fields (newlines, not spaces, so the possibly
+    # empty namespace field keeps its position): present, can_expand,
+    # namespace, bootstrap_done.
     _rdx_probe = str(local(
         'if command -v rdx > /dev/null 2>&1; then _p=yes; else _p=no; fi; ' +
         'if [ "$_p" = yes ] && rdx namespace --help > /dev/null 2>&1; ' +
@@ -826,10 +831,14 @@ def rdx_app(
         '    _ns=$(rdx namespace expand) && printf "%s" "$_ns" > "$_ck"; ' +
         '  fi; ' +
         'fi; ' +
-        'printf "%s %s %s\\n" "$_p" "$_c" "$_ns"',
-        quiet=True, echo_off=True)).strip().split()
+        '_bd=no; ' +
+        'if [ -n "$_ns" ] && [ -f /tmp/rdx-"$_ns"-bootstrapped ] && ' +
+        '   kubectl get namespace "$_ns" > /dev/null 2>&1; then _bd=yes; fi; ' +
+        'printf "%s\\n%s\\n%s\\n%s\\n" "$_p" "$_c" "$_ns" "$_bd"',
+        quiet=True, echo_off=True)).strip().split('\n')
     _rdx_present = len(_rdx_probe) > 0 and _rdx_probe[0] == 'yes'
     _rdx_can_expand = len(_rdx_probe) > 1 and _rdx_probe[1] == 'yes'
+    _probe_bootstrap_done = len(_rdx_probe) > 3 and _rdx_probe[3] == 'yes'
     if _rdx_can_expand:
         namespace = _rdx_probe[2] if len(_rdx_probe) > 2 else ''
         if not namespace:
@@ -866,10 +875,18 @@ def rdx_app(
     # out-of-band the next re-eval rebuilds it (and re-mirrors the secret).
     # That single call replaces the handful the full bootstrap makes.
     _bootstrap_sentinel = '/tmp/rdx-' + namespace + '-bootstrapped'
-    _bootstrap_done = os.path.exists(_bootstrap_sentinel) and str(local(
-        'kubectl get namespace ' + namespace +
-        ' > /dev/null 2>&1 && echo yes || echo no',
-        quiet=True, echo_off=True)).strip() == 'yes'
+    if _rdx_can_expand:
+        # Common path: the probe shell already evaluated the sentinel +
+        # liveness against this exact namespace, so reuse it — no extra
+        # cluster round-trip on every reload.
+        _bootstrap_done = _probe_bootstrap_done
+    else:
+        # Legacy fallback path: namespace came from the Starlark expander,
+        # not the probe shell, so run the liveness check here.
+        _bootstrap_done = os.path.exists(_bootstrap_sentinel) and str(local(
+            'kubectl get namespace ' + namespace +
+            ' > /dev/null 2>&1 && echo yes || echo no',
+            quiet=True, echo_off=True)).strip() == 'yes'
 
     # Pre-create the namespace idempotently. Tilt invokes `helm template`
     # (not `helm install --create-namespace`) so the namespace must exist
