@@ -2414,7 +2414,12 @@ if __name__ == "__main__":
     # Check for ingress hostname conflicts with other namespaces.
     # Two projects with the same ingress host (e.g. auth.localtest.me)
     # cause Traefik to route to the wrong service silently.
-    _check_ingress_conflicts(chart_path, chart_values_files, namespace)
+    # Gated to cold start (issue #7 M1): the underlying
+    # `kubectl get ingress --all-namespaces` is an O(cluster) scan, and a
+    # host collision can only appear when a project first comes up — it
+    # doesn't need re-checking on every src edit, only on the cold path.
+    if not _bootstrap_done:
+        _check_ingress_conflicts(chart_path, chart_values_files, namespace)
 
     k8s_yaml(helm(
         chart_path,
