@@ -2931,7 +2931,11 @@ if __name__ == "__main__":
         # Skip when no label is configured: a label-less kubectl get
         # would return EVERY cluster-scoped webhook config — far too
         # broad to safely mass-prune.
-        if _hook['webhook_app_label']:
+        # Gated to cold start (issue #7 M4): this is a stale-cluster
+        # safety net, not something that needs re-running on every save.
+        # _bootstrap_done means this session already brought the namespace
+        # up once, so any stale webhook configs were already pruned.
+        if _hook['webhook_app_label'] and not _bootstrap_done:
             _sel = 'app.kubernetes.io/name=' + _hook['webhook_app_label']
             local(
                 "set -e; " +
