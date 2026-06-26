@@ -88,6 +88,39 @@ BUILDER_IMAGES = {
     'bci': BCI_BUILDER,
 }
 
+# ─── Runtime default builder from ~/.config/rdx/config.yaml ───
+#
+# A user-level config knob (`default_builder:`) lets a developer pick the
+# builder family ONCE for their whole machine instead of passing
+# builder='bci' in every project's Tiltfile or carrying a `build.builder`
+# in every values.yaml.
+#
+# It applies at RUNTIME, not at `rdx workspace import` time: the value is
+# read here, on every Tiltfile evaluation, so editing the config file and
+# saving lets Tilt pick the change up on the next reload — existing,
+# already-imported projects included. (Contrast with baking the builder
+# into the generated Tiltfile at import time, which would freeze it.)
+#
+# Resolution precedence inside rdx_app() is: explicit builder= argument >
+# values.yaml `build.builder` > this config default > 'heroku'. The value
+# is a shorthand ('bci' / 'heroku') OR a raw CNB builder image, which is
+# used as-is (see the builder-resolution block in rdx_app()).
+#
+# Path follows the XDG Base Directory spec: $XDG_CONFIG_HOME/rdx/config.yaml
+# when XDG_CONFIG_HOME is set, else ~/.config/rdx/config.yaml. read_yaml()
+# returns the default {} when the file is absent, so a machine with no
+# config simply falls through to 'heroku'. Read ONCE at load into a
+# module-level constant so repeated rdx_app() calls in one Tiltfile don't
+# re-parse it.
+def _rdx_config_path():
+    _xdg = os.getenv('XDG_CONFIG_HOME', '')
+    if _xdg:
+        return _xdg + '/rdx/config.yaml'
+    return os.getenv('HOME', '') + '/.config/rdx/config.yaml'
+
+_RDX_CONFIG = read_yaml(_rdx_config_path(), default={}) or {}
+_RDX_DEFAULT_BUILDER = _RDX_CONFIG.get('default_builder') or ''
+
 # BCI builder live-update uid fix.
 #
 # The BCI builder builds as CNB_USER_ID=1001, but its run image
@@ -565,7 +598,7 @@ def rdx_app(
         services=None,
         chart_path=None,
         chart_values_files=None,
-        builder='heroku',
+        builder=None,
         builder_image=None,
         extra_buildpacks=[],
         additional_env={},
@@ -637,14 +670,19 @@ def rdx_app(
             deploy + port-forwards.
 
     Override:
-        builder (str): CNB builder family. 'heroku' (default) uses
+        builder (str|None): CNB builder family. 'heroku' uses
             heroku/builder:24 with heroku/* buildpacks; 'bci' uses the BCI
             builder (ghcr.io/idefxh/builder-bci-base), which ships Paketo
             buildpacks and resolves the language buildpacks by its own
             detection order — callers don't restate buildpack IDs. With
             'bci', `pack` needs local ghcr.io credentials (run
             `docker login ghcr.io` once); a preflight warns if none are
-            found.
+            found. Any other string is treated as a raw CNB builder image
+            and used as-is. **Default None — when omitted, the builder is
+            resolved at runtime from (in order) values.yaml `build.builder`,
+            then `default_builder` in ~/.config/rdx/config.yaml, then
+            'heroku'.** This means changing config.yaml re-applies on the
+            next Tilt reload without re-importing the project.
         builder_image (str): raw CNB builder image, overriding the image
             resolved from `builder` while keeping that builder's buildpack
             family. E.g. pin a digest:
@@ -1037,13 +1075,39 @@ def rdx_app(
     else:
         defaults = LANGUAGE_DEFAULTS[language]
 
-        # Resolve the builder family. `builder` selects heroku (default) or
-        # bci; `builder_image` is a raw image override layered on top.
-        _builder_kind = builder or 'heroku'
-        if _builder_kind not in BUILDER_IMAGES:
-            fail('rdx_app: unknown builder %r. Supported: %s' % (
-                _builder_kind, ', '.join(sorted(BUILDER_IMAGES.keys()))))
-        builder = builder_image or BUILDER_IMAGES[_builder_kind]
+        # Resolve the builder family. Precedence, highest first:
+        #   1. explicit builder= argument
+        #   2. values.yaml `build.builder`
+        #   3. machine default_builder from ~/.config/rdx/config.yaml
+        #   4. 'heroku'
+        # The selector is a shorthand ('heroku' -> DEFAULT_BUILDER,
+        # 'bci' -> BCI_BUILDER) or, for anything else, a raw CNB builder
+        # image used as-is. `builder_image` is a final raw override on top.
+        _builder_sel = builder
+        if _builder_sel == None or _builder_sel == '':
+            # `build.builder` may sit top-level or nested under the lib key,
+            # depending on how the project authored values.yaml. Check both.
+            _values_build = (_early_values.get('build', {}) or {}).get('builder')
+            if _values_build == None or _values_build == '':
+                _values_build = (_early_lib.get('build', {}) or {}).get('builder')
+            _builder_sel = _values_build
+        if _builder_sel == None or _builder_sel == '':
+            _builder_sel = _RDX_DEFAULT_BUILDER
+        if _builder_sel == None or _builder_sel == '':
+            _builder_sel = 'heroku'
+
+        if _builder_sel in BUILDER_IMAGES:
+            # Known shorthand: normalize the kind and map to its image.
+            _builder_kind = _builder_sel
+            _resolved_builder = BUILDER_IMAGES[_builder_sel]
+        else:
+            # Unrecognized selector: treat it as a raw builder image and use
+            # it as-is. _builder_kind stays the raw string, so the bci-only
+            # branches below (each gated on `== 'bci'`) don't fire and the
+            # caller owns the buildpack/runtime semantics.
+            _builder_kind = _builder_sel
+            _resolved_builder = _builder_sel
+        builder = builder_image or _resolved_builder
 
         # Resolve the buildpack list. The BCI builder bundles multiple
         # versions of each Paketo buildpack, so naming one without a version
