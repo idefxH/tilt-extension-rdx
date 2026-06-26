@@ -2789,6 +2789,139 @@ if __name__ == "__main__":
             block = (block.get(key, {}) or {}) if hasattr(block, 'get') else {}
         return block
 
+    # ─── Service resource-name resolution (shared) ──────────────────────
+    # The workload name is NOT always <release>-<chart-name> — some SUSE
+    # charts add a master/replica suffix (redis → <release>-redis-master,
+    # prometheus → <release>-prometheus-server, mariadb-galera variants
+    # → <release>-mariadb-primary, etc.). The authoritative source of the
+    # actual K8s resource name is the `service.host` template in the
+    # bundle's library-chart/dsl-mappings.yaml — the same template the
+    # library helper uses to build the binding-secret's `host` key.
+    # We read that file (vendored at chart_path/charts/rdx-library/
+    # dsl-mappings.yaml after `helm dep update`), pick the chart-type's
+    # entry, render the host template by substituting .Release.Name.
+    # Fallback when the file is absent (older bundle) or the type isn't
+    # catalogued: the legacy <release>-<service_type> assumption.
+    #
+    # Defined here (before the workload registration) so the app
+    # workloads can resolve a backing service's resource name to depend
+    # on it — see the OIDC/Dex ordering block below.
+    mappings_path = chart_path + '/charts/' + _lib_key + '/dsl-mappings.yaml'
+    mappings_doc = read_yaml(mappings_path, default={'charts': {}})
+    catalogued_charts = mappings_doc.get('charts', {})
+
+    def workload_name_for(release, chart_alias, service_type):
+        """Compute the rendered K8s workload name for a chart alias.
+
+        For single-instance types, chart_alias == service_type (backward compat).
+        For multi-instance types, chart_alias == <type>-<binding> and the
+        host template is adjusted accordingly.
+
+        For operator-managed types (e.g. cnpg), the `service.host` template
+        points at a Service that is created at RUNTIME by the operator
+        once the CR is reconciled (e.g. `<release>-cnpg-rw`). That name is
+        NOT in the helm-rendered manifest, so registering it with
+        k8s_resource() fails with "unknown resource". Instead, when the
+        mapping declares `operator_managed: true`, use `operator_resource`
+        — the chart-rendered operator/cluster handle that Tilt CAN see.
+        """
+        chart_entry = catalogued_charts.get(service_type, {})
+        versions = chart_entry.get('versions', [])
+        if not versions:
+            return release + '-' + chart_alias
+        ver = versions[0]
+        if ver.get('operator_managed', False):
+            op_tpl = ver.get('operator_resource', '')
+            if op_tpl:
+                if chart_alias != service_type:
+                    op_tpl = op_tpl.replace('-' + service_type, '-' + chart_alias, 1)
+                return op_tpl.replace('{{ .Release.Name }}', release).replace('{{.Release.Name}}', release)
+        host_tpl = ver.get('service', {}).get('host', '')
+        if not host_tpl:
+            return release + '-' + chart_alias
+        # For multi-instance, replace the type in the host template with the alias.
+        if chart_alias != service_type:
+            host_tpl = host_tpl.replace('-' + service_type + '.', '-' + chart_alias + '.', 1)
+        rendered = host_tpl.replace('{{ .Release.Name }}', release).replace('{{.Release.Name}}', release)
+        if '.' in rendered:
+            rendered = rendered.split('.', 1)[0]
+        return rendered
+
+    def _bad_workload_name(s):
+        """True if a computed workload name is unsafe to pass to k8s_resource.
+
+        Catches three failure shapes we've actually hit:
+          - empty / whitespace
+          - unresolved Helm template tokens ("{{") — dsl-mappings entry
+            referenced a value the Tiltfile can't substitute (e.g.
+            `{{ .Values.<binding>.host }}`)
+          - rdx's redacted-secret marker ("[redacted secret ...]") —
+            seen when the host template points at a binding-secret key
+            in connect mode and the rendered manifest leaks the marker
+            into a resource name. Registering a k8s_resource for such a
+            name fails with `unknown resource` and aborts the Tiltfile.
+
+        Skipping registration is strictly safer than aborting: Tilt will
+        still auto-discover the actual workload by its real name from
+        the manifest stream, just without our port-forward/labels overlay.
+        """
+        if not s or not s.strip():
+            return True
+        if '{{' in s or '}}' in s:
+            return True
+        if '[redacted' in s or 'redacted secret' in s:
+            return True
+        return False
+
+    # Compute chart aliases for multi-instance support (#24).
+    # Same convention as the CLI: single-instance types keep the bare type,
+    # multi-instance types get <type>-<binding> for ALL instances.
+    type_counts = {}
+    for binding_name, service_type in services.items():
+        type_counts[service_type] = type_counts.get(service_type, 0) + 1
+
+    aliases = {}  # binding → chart_alias
+    for binding_name, service_type in services.items():
+        if type_counts[service_type] == 1:
+            aliases[binding_name] = service_type
+        else:
+            aliases[binding_name] = service_type + '-' + binding_name
+
+    # ─── App → OIDC/Dex startup ordering ────────────────────────────────
+    # When a project binds an OIDC provider (Dex), the app container
+    # eagerly connects to the issuer at boot to fetch its discovery
+    # document / validate client credentials (the binding's
+    # client_id/client_secret live in values.yaml). On a cold `tilt up`
+    # the app Deployment and the Dex sub-chart are applied in the same
+    # helm stream, so Tilt may start the app pod before Dex has any
+    # ready endpoint. The app's first OIDC call then fails and — unless
+    # the app retries — it stays unhealthy until a manual restart (the
+    # "I have to restart the app for it to connect to Dex" symptom).
+    #
+    # Make the app wait: collect the registered resource name of every
+    # OIDC-provider service and hang it off the app workloads' Tilt
+    # `resource_deps`, so Tilt brings Dex up green BEFORE it starts the
+    # app. Mirrors the service-loop registration (same workload_name_for
+    # + _bad_workload_name guard) so the dep name always matches a real
+    # resource; a name we'd skip registering is also skipped here, never
+    # producing a dangling resource_deps entry that aborts the Tiltfile.
+    _OIDC_PROVIDER_TYPES = ['dex']
+    _app_oidc_deps = []
+    for _oidc_binding, _oidc_type in services.items():
+        if _oidc_type not in _OIDC_PROVIDER_TYPES:
+            continue
+        _oidc_ce = catalogued_charts.get(_oidc_type, {})
+        _oidc_cvs = _oidc_ce.get('versions', [])
+        # Operator-managed providers register under their CR name, not the
+        # host-derived name; we don't model that ordering here.
+        if _oidc_cvs and _oidc_cvs[0].get('operator_managed', False):
+            continue
+        _oidc_wl = workload_name_for(name, aliases[_oidc_binding], _oidc_type)
+        if _bad_workload_name(_oidc_wl):
+            continue
+        if _oidc_wl not in _app_oidc_deps:
+            _app_oidc_deps.append(_oidc_wl)
+
     if _workloads:
         # ─── Workloads[] mode: per-workload k8s_resource ────────────────
         # Re-read workloads from the fully-merged parsed_values so any
@@ -2844,6 +2977,7 @@ if __name__ == "__main__":
                     port_forwards='%d:%d' % (_local_port, _wl_port),
                     labels=[labels.get(_resource_name, 'app')],
                     links=_wl_links,
+                    resource_deps=_app_oidc_deps,
                     auto_init=True,
                 )
             else:
@@ -2851,6 +2985,7 @@ if __name__ == "__main__":
                     workload=_resource_name,
                     labels=[labels.get(_resource_name, 'app')],
                     links=_wl_links,
+                    resource_deps=_app_oidc_deps,
                 )
     else:
         # ─── Legacy single-workload mode ────────────────────────────────
@@ -2863,75 +2998,12 @@ if __name__ == "__main__":
             port_forwards='%d:%d' % (port, port),
             labels=[labels.get(name, 'app')],
             links=app_links,
+            resource_deps=_app_oidc_deps,
         )
 
-    # Surface each declared service on its conventional port. The
-    # workload name is NOT always <release>-<chart-name> — some SUSE
-    # charts add a master/replica suffix (redis → <release>-redis-master,
-    # prometheus → <release>-prometheus-server, mariadb-galera variants
-    # → <release>-mariadb-primary, etc.). The authoritative source of the
-    # actual K8s resource name is the `service.host` template in the
-    # bundle's library-chart/dsl-mappings.yaml — the same template the
-    # library helper uses to build the binding-secret's `host` key.
-    # We read that file (vendored at chart_path/charts/rdx-library/
-    # dsl-mappings.yaml after `helm dep update`), pick the chart-type's
-    # entry, render the host template by substituting .Release.Name.
-    # Fallback when the file is absent (older bundle) or the type isn't
-    # catalogued: the legacy <release>-<service_type> assumption.
-    mappings_path = chart_path + '/charts/' + _lib_key + '/dsl-mappings.yaml'
-    mappings_doc = read_yaml(mappings_path, default={'charts': {}})
-    catalogued_charts = mappings_doc.get('charts', {})
-
-    def workload_name_for(release, chart_alias, service_type):
-        """Compute the rendered K8s workload name for a chart alias.
-
-        For single-instance types, chart_alias == service_type (backward compat).
-        For multi-instance types, chart_alias == <type>-<binding> and the
-        host template is adjusted accordingly.
-
-        For operator-managed types (e.g. cnpg), the `service.host` template
-        points at a Service that is created at RUNTIME by the operator
-        once the CR is reconciled (e.g. `<release>-cnpg-rw`). That name is
-        NOT in the helm-rendered manifest, so registering it with
-        k8s_resource() fails with "unknown resource". Instead, when the
-        mapping declares `operator_managed: true`, use `operator_resource`
-        — the chart-rendered operator/cluster handle that Tilt CAN see.
-        """
-        chart_entry = catalogued_charts.get(service_type, {})
-        versions = chart_entry.get('versions', [])
-        if not versions:
-            return release + '-' + chart_alias
-        ver = versions[0]
-        if ver.get('operator_managed', False):
-            op_tpl = ver.get('operator_resource', '')
-            if op_tpl:
-                if chart_alias != service_type:
-                    op_tpl = op_tpl.replace('-' + service_type, '-' + chart_alias, 1)
-                return op_tpl.replace('{{ .Release.Name }}', release).replace('{{.Release.Name}}', release)
-        host_tpl = ver.get('service', {}).get('host', '')
-        if not host_tpl:
-            return release + '-' + chart_alias
-        # For multi-instance, replace the type in the host template with the alias.
-        if chart_alias != service_type:
-            host_tpl = host_tpl.replace('-' + service_type + '.', '-' + chart_alias + '.', 1)
-        rendered = host_tpl.replace('{{ .Release.Name }}', release).replace('{{.Release.Name}}', release)
-        if '.' in rendered:
-            rendered = rendered.split('.', 1)[0]
-        return rendered
-
-    # Compute chart aliases for multi-instance support (#24).
-    # Same convention as the CLI: single-instance types keep the bare type,
-    # multi-instance types get <type>-<binding> for ALL instances.
-    type_counts = {}
-    for binding_name, service_type in services.items():
-        type_counts[service_type] = type_counts.get(service_type, 0) + 1
-
-    aliases = {}  # binding → chart_alias
-    for binding_name, service_type in services.items():
-        if type_counts[service_type] == 1:
-            aliases[binding_name] = service_type
-        else:
-            aliases[binding_name] = service_type + '-' + binding_name
+    # Surface each declared service on its conventional port, using the
+    # shared service-name machinery (mappings_path / catalogued_charts /
+    # workload_name_for / aliases) defined above the workload block.
 
     # Register CRD kinds for operator-managed charts so Tilt
     # recognises them as claimable objects in k8s_resource(objects=...).
@@ -2947,32 +3019,6 @@ if __name__ == "__main__":
                 if _kind_key and _kind_key not in _registered_kinds:
                     k8s_kind(_kind_key, api_version=_api_ver, pod_readiness='wait')
                     _registered_kinds[_kind_key] = True
-
-    def _bad_workload_name(s):
-        """True if a computed workload name is unsafe to pass to k8s_resource.
-
-        Catches three failure shapes we've actually hit:
-          - empty / whitespace
-          - unresolved Helm template tokens ("{{") — dsl-mappings entry
-            referenced a value the Tiltfile can't substitute (e.g.
-            `{{ .Values.<binding>.host }}`)
-          - rdx's redacted-secret marker ("[redacted secret ...]") —
-            seen when the host template points at a binding-secret key
-            in connect mode and the rendered manifest leaks the marker
-            into a resource name. Registering a k8s_resource for such a
-            name fails with `unknown resource` and aborts the Tiltfile.
-
-        Skipping registration is strictly safer than aborting: Tilt will
-        still auto-discover the actual workload by its real name from
-        the manifest stream, just without our port-forward/labels overlay.
-        """
-        if not s or not s.strip():
-            return True
-        if '{{' in s or '}}' in s:
-            return True
-        if '[redacted' in s or 'redacted secret' in s:
-            return True
-        return False
 
     # ─── Operator admission-webhook lifecycle hooks ─────────────────────
     # Catalog-driven webhook lifecycle for any chart that bundles an
