@@ -29,6 +29,11 @@ BUILDER_IMAGES = {
 }
 
 
+def _is_bci_builder_image(image):
+    """Mirror of the Tiltfile helper: a BCI builder by image, not shorthand."""
+    return image != None and 'builder-bci' in image
+
+
 def resolve_builder(builder=None, values=None, lib_values=None,
                     config_default='', builder_image=None):
     """Mirror of the Tiltfile builder-resolution block.
@@ -57,6 +62,9 @@ def resolve_builder(builder=None, values=None, lib_values=None,
         _builder_kind = _builder_sel
         _resolved_builder = _builder_sel
     resolved = builder_image or _resolved_builder
+
+    if _builder_kind != 'bci' and _is_bci_builder_image(resolved):
+        _builder_kind = 'bci'
     return _builder_kind, resolved
 
 
@@ -138,6 +146,46 @@ def test_precedence_values_beats_config():
            + repr(kind))
 
 
+def test_raw_bci_image_arg_normalizes_to_bci_kind():
+    # The reported bug: passing the raw BCI image instead of the 'bci'
+    # shorthand must still take the bci-only paths (no heroku/procfile).
+    kind, img = resolve_builder(builder=BCI_BUILDER)
+    _check(kind == 'bci', 'raw BCI image must normalize to kind bci: '
+           + repr(kind))
+    _check(img == BCI_BUILDER, 'image used as-is: ' + img)
+
+
+def test_raw_bci_image_future_tag_normalizes():
+    raw = 'ghcr.io/idefxh/builder-bci-base:99.9.9'
+    kind, img = resolve_builder(builder=raw)
+    _check(kind == 'bci', 'a future BCI tag must still be kind bci: '
+           + repr(kind))
+    _check(img == raw, img)
+
+
+def test_bci_image_via_config_default_normalizes():
+    kind, _ = resolve_builder(config_default=BCI_BUILDER)
+    _check(kind == 'bci', 'BCI image as config default_builder: ' + repr(kind))
+
+
+def test_builder_image_override_to_bci_normalizes_kind():
+    # builder defaults to heroku, but a builder_image override points at BCI:
+    # the final image wins, so the kind must flip to bci.
+    kind, img = resolve_builder(builder_image=BCI_BUILDER)
+    _check(kind == 'bci', 'BCI builder_image override must flip kind: '
+           + repr(kind))
+    _check(img == BCI_BUILDER, img)
+
+
+def test_non_bci_raw_image_stays_raw():
+    # Guard the substring match: a SUSE bci/builder path that is NOT the
+    # idefxh builder-bci image must NOT be mistaken for the BCI builder.
+    raw = 'registry.suse.com/bci/builder:42'
+    kind, img = resolve_builder(builder=raw)
+    _check(kind == raw, 'non builder-bci image stays raw kind: ' + repr(kind))
+    _check(img == raw, img)
+
+
 if __name__ == '__main__':
     failures = 0
     for fn in (test_explicit_arg_wins_over_everything,
@@ -149,7 +197,12 @@ if __name__ == '__main__':
                test_falls_back_to_heroku_when_nothing_set,
                test_empty_string_config_falls_back_to_heroku,
                test_builder_image_overrides_resolved_image_keeps_kind,
-               test_precedence_values_beats_config):
+               test_precedence_values_beats_config,
+               test_raw_bci_image_arg_normalizes_to_bci_kind,
+               test_raw_bci_image_future_tag_normalizes,
+               test_bci_image_via_config_default_normalizes,
+               test_builder_image_override_to_bci_normalizes_kind,
+               test_non_bci_raw_image_stays_raw):
         try:
             fn()
             sys.stdout.write('PASS %s\n' % fn.__name__)

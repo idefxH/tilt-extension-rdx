@@ -88,6 +88,21 @@ BUILDER_IMAGES = {
     'bci': BCI_BUILDER,
 }
 
+
+# Recognize a BCI builder by its IMAGE, not just the 'bci' shorthand. The
+# idefxh BCI builders are published as .../builder-bci-*:<tag> (e.g.
+# builder-bci-base:16.0.2). A developer who passes the raw image directly —
+# builder='ghcr.io/idefxh/builder-bci-base:16.0.2', a values.yaml
+# build.builder, a config default_builder, or a builder_image override —
+# instead of the 'bci' shorthand must STILL take the bci-only code paths.
+# Otherwise _builder_kind stays the raw string, the `== 'bci'` branches in
+# rdx_app() don't fire, and the heroku defaults (heroku/nodejs +
+# heroku/procfile) get injected. heroku/procfile then fails detection on BCI
+# (no Procfile in the project), aborting the whole build with
+# "No buildpack groups passed detection".
+def _is_bci_builder_image(image):
+    return image != None and 'builder-bci' in image
+
 # ─── Runtime default builder from ~/.config/rdx/config.yaml ───
 #
 # A user-level config knob (`default_builder:`) lets a developer pick the
@@ -1108,6 +1123,14 @@ def rdx_app(
             _builder_kind = _builder_sel
             _resolved_builder = _builder_sel
         builder = builder_image or _resolved_builder
+
+        # Normalize a raw BCI builder image (raw selector or builder_image
+        # override) to kind 'bci' so the bci-only branches below fire — no
+        # heroku/* buildpacks, named-volume cache, runAsUser fix. Keyed on the
+        # final resolved image, so a builder_image override pointing at BCI is
+        # caught even when the selector was heroku. See _is_bci_builder_image.
+        if _builder_kind != 'bci' and _is_bci_builder_image(builder):
+            _builder_kind = 'bci'
 
         # Resolve the buildpack list. The BCI builder bundles multiple
         # versions of each Paketo buildpack, so naming one without a version
