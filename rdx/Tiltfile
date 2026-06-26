@@ -474,7 +474,16 @@ def _ingress_cluster_ip():
     fail) when nothing matches or the Service is headless (clusterIP
     None), since a headless IP can't be used as a DNS target.
     """
+    # The Traefik ClusterIP is stable for the life of a cluster, but this
+    # ran up to 3 kubectl round-trips on every reload for loopback domains
+    # (issue #7 M3). Cache the resolved IP to /tmp, keyed on the active
+    # k8s context so a context switch re-resolves rather than reusing a
+    # stale cluster's IP. The cache lives in /tmp, so a reboot starts
+    # clean. Only a valid (non-empty, non-"None") IP is cached.
+    _cache = '/tmp/rdx-traefik-clusterip-' + k8s_context().replace('/', '_')
     ip = str(local(
+        '_cf="' + _cache + '"; ' +
+        'if [ -s "$_cf" ]; then cat "$_cf"; else ' +
         "ip=$(kubectl get svc -A -l 'app.kubernetes.io/name=traefik' " +
         "-o jsonpath='{.items[0].spec.clusterIP}' 2>/dev/null); " +
         "[ -z \"$ip\" ] && ip=$(kubectl get svc -A " +
@@ -482,7 +491,9 @@ def _ingress_cluster_ip():
         "-o jsonpath='{.items[0].spec.clusterIP}' 2>/dev/null); " +
         "[ -z \"$ip\" ] && ip=$(kubectl get svc traefik -n kube-system " +
         "-o jsonpath='{.spec.clusterIP}' 2>/dev/null); " +
-        "echo \"$ip\" || true",
+        'if [ -n "$ip" ] && [ "$ip" != None ]; then printf "%s" "$ip" > "$_cf"; fi; ' +
+        'echo "$ip"; ' +
+        'fi',
         quiet=True, echo_off=True,
     )).strip()
     if ip == 'None':
