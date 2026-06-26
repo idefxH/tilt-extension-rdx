@@ -2244,9 +2244,26 @@ if __name__ == "__main__":
     #     tree, so the win compounds. helm dep build would be even faster
     #     but requires a lock; we keep `update --skip-refresh` for the
     #     first-run / after-upgrade case where the lock isn't present yet.
+    # Two passes (issue #7 H2). On cold start each sub-chart used to run
+    # its `helm dependency update --skip-refresh` (the OCI pulls that
+    # dominate cold wall-clock) one after another. Those pulls are
+    # independent per sub-chart, so we parallelize them — but keep the
+    # repo-registration step serial because `bootstrap_helm_repos.py`
+    # mutates global helm state (`helm repo add` writes
+    # ~/.config/helm/repositories.yaml) and racing it across sub-charts
+    # could corrupt that file.
+    #
+    #   Pass 1 (serial): filter deps + register repos + fast-path align.
+    #     Collects the sub-charts that still need an OCI pull into $_need.
+    #   Pass 2 (parallel, bounded fan-out): `helm dependency update` +
+    #     align per sub-chart. Each runs in its own subshell writing only
+    #     into that sub-chart's charts/, so they don't contend. A failure
+    #     marker turns any sub-chart's failure into a loud overall failure
+    #     (set -e can't see into backgrounded subshells).
     helm_dep_script = (
         'set -e; ' +
         'if [ -d "' + chart_path + '/charts" ]; then ' +
+        '  _need=$(mktemp); ' +
         '  for sub in "' + chart_path + '"/charts/*/; do ' +
         '    [ -d "$sub" ] || continue; ' +
         '    [ -f "$sub/Chart.yaml" ] || continue; ' +
@@ -2272,6 +2289,7 @@ if __name__ == "__main__":
         # library Chart.yaml.full, so the subsequent
         # `helm dep update --skip-refresh` can find their indexes.
         # Idempotent + cheap. PyYAML required (already enforced above).
+        # Stays serial: helm repo add mutates global helm config.
         '    python3 "' + bootstrap_repos_script_path + '" "$sub" || ' +
         '      { echo "[rdx] FATAL: bootstrap_helm_repos.py failed for $sub"; exit 1; }; ' +
         # Fast-path: lock fresh AND charts/ populated -> skip update.
@@ -2279,10 +2297,15 @@ if __name__ == "__main__":
         '       [ -d "$sub/charts" ] && [ -n "$(ls -A "$sub/charts" 2>/dev/null)" ]; then ' +
         '      echo "[rdx] $sub deps up to date, skipping helm dep update"; ' +
         '      python3 "' + align_script_path + '" "$sub"; ' +
-        '      continue; ' +
+        '    else ' +
+        '      printf "%s\\n" "$sub" >> "$_need"; ' +
         '    fi; ' +
-        '    echo "[rdx] helm dep update --skip-refresh $sub"; ' +
-        '    helm dependency update --skip-refresh "$sub"; ' +
+        '  done; ' +
+        # Pass 2: parallel OCI pulls, bounded to 4 concurrent.
+        '  _fail=$(mktemp); rm -f "$_fail"; _n=0; ' +
+        '  while IFS= read -r sub; do ' +
+        '    [ -n "$sub" ] || continue; ' +
+        '    ( echo "[rdx] helm dep update --skip-refresh $sub"; ' +
         # SUSE packaging quirk: their Helm charts publish OCI artifact
         # tags like "0.4.4-29.1" but Chart.yaml inside says version
         # "0.4.4". Helm matches deps against the INTERNAL version, so
@@ -2291,8 +2314,18 @@ if __name__ == "__main__":
         # never reach the sub-chart (no app user, no auth db). Patch
         # each pulled sub-chart to align its internal version with what
         # the parent expects. Drop when SUSE aligns version<->tag.
-        '    python3 "' + align_script_path + '" "$sub"; ' +
-        '  done; ' +
+        '      helm dependency update --skip-refresh "$sub" && ' +
+        '      python3 "' + align_script_path + '" "$sub" || ' +
+        '      { echo "[rdx] FATAL: helm dep update/align failed for $sub" >&2; : > "$_fail"; } ' +
+        '    ) & ' +
+        '    _n=$((_n+1)); ' +
+        '    if [ "$_n" -ge 4 ]; then wait; _n=0; fi; ' +
+        '  done < "$_need"; ' +
+        '  wait; ' +
+        '  rm -f "$_need"; ' +
+        '  if [ -f "$_fail" ]; then rm -f "$_fail"; ' +
+        '    echo "[rdx] FATAL: one or more sub-chart dep updates failed" >&2; exit 1; fi; ' +
+        '  rm -f "$_fail"; ' +
         'fi'
     )
     local(helm_dep_script, echo_off=True, quiet=False)
