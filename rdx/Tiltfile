@@ -890,7 +890,9 @@ def rdx_app(
         'fi; ' +
         '_bd=no; ' +
         'if [ -n "$_ns" ] && [ -f /tmp/rdx-"$_ns"-bootstrapped ] && ' +
-        '   kubectl get namespace "$_ns" > /dev/null 2>&1; then _bd=yes; fi; ' +
+        '   kubectl get namespace "$_ns" > /dev/null 2>&1 && ' +
+        '   ([ "${RDX_SKIP_PULLSECRET_MIRROR:-0}" = "1" ] || kubectl get secret -n "$_ns" application-collection > /dev/null 2>&1); ' +
+        'then _bd=yes; fi; ' +
         'printf "%s\\n%s\\n%s\\n%s\\n" "$_p" "$_c" "$_ns" "$_bd"',
         quiet=True, echo_off=True)).strip().split('\n')
     _rdx_present = len(_rdx_probe) > 0 and _rdx_probe[0] == 'yes'
@@ -942,7 +944,10 @@ def rdx_app(
         # not the probe shell, so run the liveness check here.
         _bootstrap_done = os.path.exists(_bootstrap_sentinel) and str(local(
             'kubectl get namespace ' + namespace +
-            ' > /dev/null 2>&1 && echo yes || echo no',
+            ' > /dev/null 2>&1 && ' +
+            '([ "${RDX_SKIP_PULLSECRET_MIRROR:-0}" = "1" ] || ' +
+            'kubectl get secret -n ' + namespace + ' application-collection > /dev/null 2>&1) && ' +
+            'echo yes || echo no',
             quiet=True, echo_off=True)).strip() == 'yes'
 
     # One concise banner on the cold path so the bootstrap work below reads
