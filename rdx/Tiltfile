@@ -600,12 +600,984 @@ def _apply_coredns_hairpin(domain, workspace):
     k8s_yaml(blob(_coredns_hairpin_yaml(domain, ip, workspace)))
 
 
-# Conventional ports for service types declared in `services`. Used by
-# port_forwards so a developer can `psql -h localhost -p 5432`, etc.
-# Legacy hardcoded ports — used as fallback when dsl-mappings.yaml
-# doesn't declare a port for the chart type (older bundles, charts
-# not in the catalog). New charts should declare their port in
-# dsl-mappings.yaml instead of adding to this dict.
+# ═══════════════════════════════════════════════════════════════════════
+# Phase helpers for rdx_app() — each encapsulates one logical stage of
+# the build-deploy pipeline. rdx_app() orchestrates them in order.
+# ═══════════════════════════════════════════════════════════════════════
+
+def _resolve_chart_and_stage(name, chart_path):
+    """Detect chart_path, library values key, and RDX stage.
+
+    Returns a dict with keys: chart_path, lib_key, stage.
+    """
+    if chart_path == None:
+        if os.path.exists('deploy/Chart.yaml'):
+            chart_path = 'deploy'
+        elif os.path.exists('chart/Chart.yaml'):
+            chart_path = 'chart'
+        else:
+            chart_path = 'chart'
+
+    _lib_key = _detect_lib_key(chart_path)
+
+    _stage = os.getenv('RDX_STAGE', '')
+    if not _stage:
+        _stage_file = os.path.join(chart_path, '..', '.rdx', 'stage')
+        if os.path.exists(_stage_file):
+            _stage = str(read_file(_stage_file)).strip()
+    if not _stage:
+        _stage = 'dev'
+
+    return {'chart_path': chart_path, 'lib_key': _lib_key, 'stage': _stage}
+
+
+def _bootstrap_namespace(name, chart_path, _lib_key):
+    """Resolve namespace, probe rdx binary, create namespace, mirror pull-secret.
+
+    Returns a dict with keys: namespace, rdx_present, rdx_can_expand,
+    bootstrap_done.
+    """
+    _rdx_probe = str(local(
+        'if command -v rdx > /dev/null 2>&1; then _p=yes; else _p=no; fi; ' +
+        'if [ "$_p" = yes ] && rdx namespace --help > /dev/null 2>&1; ' +
+        'then _c=yes; else _c=no; fi; ' +
+        '_ns=""; ' +
+        'if [ "$_c" = yes ]; then ' +
+        '  _ck=/tmp/rdx-nsexpand-$(pwd | cksum | cut -d" " -f1); ' +
+        '  if [ -f "$_ck" ] && [ "$_ck" -nt .rdx/project.yaml ]; then ' +
+        '    _ns=$(cat "$_ck"); ' +
+        '  else ' +
+        '    _ns=$(rdx namespace expand) && printf "%s" "$_ns" > "$_ck"; ' +
+        '  fi; ' +
+        'fi; ' +
+        '_bd=no; ' +
+        'if [ -n "$_ns" ] && [ -f /tmp/rdx-"$_ns"-bootstrapped ] && ' +
+        '   kubectl get namespace "$_ns" > /dev/null 2>&1 && ' +
+        '   ([ "${RDX_SKIP_PULLSECRET_MIRROR:-0}" = "1" ] || kubectl get secret -n "$_ns" application-collection > /dev/null 2>&1); ' +
+        'then _bd=yes; fi; ' +
+        'printf "%s\\n%s\\n%s\\n%s\\n" "$_p" "$_c" "$_ns" "$_bd"',
+        quiet=True, echo_off=True)).strip().split('\n')
+    _rdx_present = len(_rdx_probe) > 0 and _rdx_probe[0] == 'yes'
+    _rdx_can_expand = len(_rdx_probe) > 1 and _rdx_probe[1] == 'yes'
+    _probe_bootstrap_done = len(_rdx_probe) > 3 and _rdx_probe[3] == 'yes'
+    if _rdx_can_expand:
+        namespace = _rdx_probe[2] if len(_rdx_probe) > 2 else ''
+        if not namespace:
+            fail('rdx_app: `rdx namespace expand` returned empty output. Check `.rdx/project.yaml`.')
+    else:
+        project_meta = read_yaml('.rdx/project.yaml', default={})
+        ns_template = ((project_meta.get('namespace', {}) or {}).get('local', '') or '{{.project}}')
+        user_value = str(local('echo "${USER:-default}"', quiet=True, echo_off=True)).strip() or 'default'
+        namespace = ns_template
+        for token, value in [('{{.project}}', name), ('{{ .project }}', name),
+                             ('{{.user}}', user_value), ('{{ .user }}', user_value)]:
+            namespace = namespace.replace(token, value)
+        if '{{' in namespace or '}}' in namespace:
+            fail((
+                'rdx_app: namespace template %r contains an unrecognised token ' +
+                'after expansion (got %r). Allowed tokens: {{.project}}, {{.user}}. ' +
+                'Edit .rdx/project.yaml namespace.local to fix, or install rdx 0.1.47+ ' +
+                'so this extension can shell out to `rdx namespace expand` instead.'
+            ) % (ns_template, namespace))
+
+    _bootstrap_sentinel = '/tmp/rdx-' + namespace + '-bootstrapped'
+    if _rdx_can_expand:
+        _bootstrap_done = _probe_bootstrap_done
+    else:
+        _bootstrap_done = os.path.exists(_bootstrap_sentinel) and str(local(
+            'kubectl get namespace ' + namespace +
+            ' > /dev/null 2>&1 && ' +
+            '([ "${RDX_SKIP_PULLSECRET_MIRROR:-0}" = "1" ] || ' +
+            'kubectl get secret -n ' + namespace + ' application-collection > /dev/null 2>&1) && ' +
+            'echo yes || echo no',
+            quiet=True, echo_off=True)).strip() == 'yes'
+
+    if not _bootstrap_done:
+        print('rdx: first-run bootstrap for namespace ' + namespace +
+              ' (namespace + pull-secret + charts)…')
+
+    if not _bootstrap_done:
+        local(
+            'kubectl create namespace ' + namespace +
+            ' --dry-run=client -o yaml | kubectl apply -f -',
+            quiet=True, echo_off=True)
+
+    if not _bootstrap_done and os.getenv('RDX_SKIP_PULLSECRET_MIRROR', '') != '1':
+        local(
+            "set -e; " +
+            "if kubectl get secret -n " + namespace + " application-collection " +
+            ">/dev/null 2>&1; then exit 0; fi; " +
+            "if [ \"$(kubectl get ns " + namespace + " -o " +
+            "jsonpath='{.metadata.labels.rdx\\.io/pullsecret-managed-by}' " +
+            "2>/dev/null)\" = 'operator' ]; then " +
+            "echo '[rdx] skipping pullsecret mirror " +
+            "(ns " + namespace + " labelled rdx.suse.com/pullsecret-managed-by=operator)'; " +
+            "exit 0; fi; " +
+            "if [ -n \"$(kubectl get secret -n default application-collection -o " +
+            "jsonpath='{.metadata.annotations.external-secrets\\.io/owned-by}' " +
+            "2>/dev/null)\" ]; then " +
+            "echo '[rdx] skipping pullsecret mirror " +
+            "(default Secret has external-secrets.io annotation; ESO will distribute)'; " +
+            "exit 0; fi; " +
+            "if [ \"$(kubectl get secret -n default application-collection -o " +
+            "jsonpath='{.metadata.annotations.reflector\\.v1\\.k8s\\.emberstack\\.com/reflection-allowed}' " +
+            "2>/dev/null)\" = 'true' ]; then " +
+            "echo '[rdx] skipping pullsecret mirror " +
+            "(default Secret has reflector annotation; kubernetes-reflector will distribute)'; " +
+            "exit 0; fi; " +
+            "if ! kubectl get secret -n default application-collection " +
+            ">/dev/null 2>&1; then " +
+            "echo '[rdx] FATAL: Secret/application-collection not found " +
+            "in `default` (the SUSE Rancher Desktop extension would normally " +
+            "install it there). Either install/launch the SUSE extension, " +
+            "OR run `helm registry login dp.apps.rancher.io` then bootstrap " +
+            "the Secret manually via kubectl create secret docker-registry; " +
+            "OR set RDX_SKIP_PULLSECRET_MIRROR=1 if your cluster uses " +
+            "kubernetes-reflector / External Secrets to distribute it.' >&2; " +
+            "exit 1; fi; " +
+            "kubectl get secret -n default application-collection -o yaml | " +
+            "sed -e '/^  namespace:/d' " +
+            "-e '/^  uid:/d' " +
+            "-e '/^  resourceVersion:/d' " +
+            "-e '/^  creationTimestamp:/d' | " +
+            "kubectl apply -n " + namespace + " -f - >/dev/null && " +
+            "echo '[rdx] mirrored Secret/application-collection " +
+            "default -> " + namespace + "'",
+            quiet=False, echo_off=True)
+
+    if not _bootstrap_done:
+        local('touch ' + _bootstrap_sentinel, quiet=True, echo_off=True)
+
+    return {
+        'namespace': namespace,
+        'rdx_present': _rdx_present,
+        'rdx_can_expand': _rdx_can_expand,
+        'bootstrap_done': _bootstrap_done,
+    }
+
+
+def _resolve_image_strategy(
+        name, language, builder, builder_image, extra_buildpacks,
+        additional_env, live_reload, node_version, bp_log_level,
+        image_labels, runtime_cert_binding, debug, debug_port,
+        live_update_paths, image_ref, helm_only, build_path,
+        chart_path, _lib_key, _workloads, _early_values, _early_lib):
+    """Determine build strategy and register custom_build resources.
+
+    Returns a dict with keys: builder_kind, img_repo, img_tag.
+    For helm_only mode, builder_kind is None.
+    """
+    _builder_kind = None
+    _img_repo = ''
+    _img_tag = ''
+
+    if helm_only:
+        pass
+    elif image_ref:
+        if ':' in image_ref:
+            _img_repo, _img_tag = image_ref.rsplit(':', 1)
+        else:
+            _img_repo = image_ref
+            _img_tag = 'latest'
+    else:
+        defaults = LANGUAGE_DEFAULTS[language]
+
+        _builder_sel = builder
+        if _builder_sel == None or _builder_sel == '':
+            _values_build = (_early_values.get('build', {}) or {}).get('builder')
+            if _values_build == None or _values_build == '':
+                _values_build = (_early_lib.get('build', {}) or {}).get('builder')
+            _builder_sel = _values_build
+        if _builder_sel == None or _builder_sel == '':
+            _builder_sel = _RDX_DEFAULT_BUILDER
+        if _builder_sel == None or _builder_sel == '':
+            _builder_sel = 'heroku'
+
+        if _builder_sel in BUILDER_IMAGES:
+            _builder_kind = _builder_sel
+            _resolved_builder = BUILDER_IMAGES[_builder_sel]
+        else:
+            _builder_kind = _builder_sel
+            _resolved_builder = _builder_sel
+        builder = builder_image or _resolved_builder
+
+        if _builder_kind != 'bci' and _is_bci_builder_image(builder):
+            _builder_kind = 'bci'
+
+        if _builder_kind == 'bci':
+            buildpacks = list(extra_buildpacks)
+        else:
+            buildpacks = defaults['buildpacks'] + extra_buildpacks
+
+        _reload_supported = bool(defaults.get('bci_reload'))
+        if live_reload == None:
+            live_reload = (_builder_kind == 'bci' and _reload_supported)
+        if _builder_kind != 'bci':
+            _bci_only_knobs = []
+            if live_reload:
+                _bci_only_knobs.append('live_reload')
+            if node_version != None:
+                _bci_only_knobs.append('node_version')
+            if bp_log_level != None:
+                _bci_only_knobs.append('bp_log_level')
+            if image_labels != None:
+                _bci_only_knobs.append('image_labels')
+            if runtime_cert_binding != None:
+                _bci_only_knobs.append('runtime_cert_binding')
+            if debug:
+                _bci_only_knobs.append('debug')
+            if _bci_only_knobs:
+                print('rdx: warning — ' + ', '.join(_bci_only_knobs) +
+                      ' only affect the BCI builder (Paketo BP_*/BPE_* knobs); ' +
+                      'ignored for builder=' + repr(_builder_kind) + '. The ' +
+                      'heroku path already live-reloads via the Procfile `dev:` ' +
+                      'process (nodemon).')
+        elif live_reload and not _reload_supported:
+            print('rdx: warning — live_reload=True ignored for language ' +
+                  repr(language) + ' on the BCI builder: its buildpack ' +
+                  'contributes no watchexec `reload` process. Source changes ' +
+                  'trigger a full (layer-cached) pack rebuild.')
+
+        if _builder_kind == 'bci' and os.getenv('RDX_SKIP_GHCR_CHECK', '') != '1':
+            local(
+                "if [ -f \"$HOME/.docker/config.json\" ] && " +
+                "grep -q 'ghcr.io' \"$HOME/.docker/config.json\" 2>/dev/null; then exit 0; fi; " +
+                "echo '[rdx] WARN: no ghcr.io entry in ~/.docker/config.json. " +
+                "The BCI builder (" + builder + ") is in a private registry; " +
+                "run `docker login ghcr.io` if `pack build` fails to pull it. " +
+                "Set RDX_SKIP_GHCR_CHECK=1 to silence this check.' >&2",
+                quiet=False, echo_off=True)
+
+        sync_paths = live_update_paths if live_update_paths != None else defaults['live_update_paths']
+
+        cache_dir = '/tmp/rdx-pack-cache-' + name
+        cache_vol = 'rdx-pack-cache-' + name
+        pack_args = ['pack', 'build', '$EXPECTED_REF']
+        if _builder_kind == 'heroku':
+            pack_args.extend([
+                '--cache', '"type=build;format=bind;source=' + cache_dir + '"',
+                '--cache', '"type=launch;format=bind;source=' + cache_dir + '-launch"',
+            ])
+        else:
+            pack_args.extend([
+                '--cache', '"type=build;format=volume;name=' + cache_vol + '"',
+                '--cache', '"type=launch;format=volume;name=' + cache_vol + '-launch"',
+            ])
+        pack_args.extend(['--builder', builder])
+        for bp in buildpacks:
+            pack_args.extend(['--buildpack', bp])
+        for k, v in additional_env.items():
+            pack_args.extend(['--env', '%s=%s' % (k, v)])
+        _reload_proc = None
+        if _builder_kind == 'bci':
+            _reload_proc = _bci_reload_default_process(live_reload, _reload_supported)
+        if _reload_proc:
+            pack_args.extend(['--default-process', _reload_proc])
+        else:
+            dev_proc = defaults.get('pack_default_process')
+            if dev_proc:
+                _procfile_path = build_path + '/Procfile'
+                _has_dev_proc = False
+                if os.path.exists(_procfile_path):
+                    _pf_content = str(read_file(_procfile_path))
+                    for _pf_line in _pf_content.splitlines():
+                        if _pf_line.startswith(dev_proc + ':'):
+                            _has_dev_proc = True
+                            break
+                if _has_dev_proc:
+                    pack_args.extend(['--default-process', dev_proc])
+        for k, v in (defaults.get('pack_build_env') or {}).items():
+            pack_args.extend(['--env', '%s=%s' % (k, v)])
+        for k, v in (BUILDER_BUILD_ENV.get(_builder_kind, {}).get(language, {}) or {}).items():
+            pack_args.extend(['--env', '%s=%s' % (k, v)])
+        if _builder_kind == 'bci':
+            _bci_env = _resolve_bci_build_env(
+                language, live_reload, _reload_supported, node_version,
+                bp_log_level, image_labels, runtime_cert_binding,
+                debug, debug_port)
+            for k, v in _bci_env.items():
+                if ' ' in str(v):
+                    pack_args.extend(['--env', '%s="%s"' % (k, v)])
+                else:
+                    pack_args.extend(['--env', '%s=%s' % (k, v)])
+        _excl_action = _bci_procfile_exclude_action(
+            _builder_kind, live_reload, _reload_supported,
+            os.path.exists(build_path + '/Procfile'),
+            os.path.exists(build_path + '/project.toml'))
+        if _excl_action == 'exclude':
+            _descriptor_path = '/tmp/rdx-pack-descriptor-' + name + '.toml'
+            _descriptor_content = '\n'.join([
+                '# Generated by tilt-extension-rdx (builder=bci, live_reload=True).',
+                '# Excludes the Procfile so heroku/procfile-style process types',
+                "# don't overwrite Paketo npm-start's watchexec-wrapped `web`.",
+                '[_]',
+                'schema-version = "0.2"',
+                '',
+                '[io.buildpacks]',
+                'exclude = ["Procfile"]',
+                '',
+            ])
+            local(
+                "cat > '" + _descriptor_path + "' <<'RDXEOF'\n" +
+                _descriptor_content + "RDXEOF\n",
+                quiet=True, echo_off=True)
+            pack_args.extend(['--descriptor', _descriptor_path])
+        elif _excl_action == 'warn':
+            print('rdx: warning — live_reload=True with builder=bci, but ' +
+                  build_path + '/project.toml exists, so the Procfile is NOT ' +
+                  'excluded from the build. The procfile buildpack will ' +
+                  "overwrite Paketo's watchexec-wrapped `web` process and live " +
+                  'reload will not take effect. Add `exclude = ["Procfile"]` ' +
+                  'under [io.buildpacks] in your project.toml to enable it.')
+
+        pack_cmd_base = ' '.join(pack_args)
+        pack_cmd = pack_cmd_base + ' --path ' + build_path
+
+        if language == 'go' and os.path.exists('go.mod'):
+            local(
+                "set -e; " +
+                "if ! command -v go >/dev/null 2>&1; then " +
+                "echo '[rdx] go not on PATH; skipping go mod tidy preflight' >&2; " +
+                "exit 0; fi; " +
+                "if [ ! -f go.sum ] || [ go.mod -nt go.sum ]; then " +
+                "echo '[rdx] running go mod tidy (go.sum missing or stale)'; " +
+                "go mod tidy; " +
+                "fi",
+                quiet=False, echo_off=True,
+            )
+
+        live_update_steps = []
+        for path in sync_paths:
+            sync_target = '/workspace/' + path.lstrip('./')
+            live_update_steps.append(sync(path, sync_target))
+        install_cmd = defaults.get('live_update_install_cmd')
+        install_trigger = defaults.get('live_update_install_trigger', [])
+        if install_cmd and install_trigger:
+            live_update_steps.append(run(install_cmd, trigger=install_trigger))
+
+        deps = sync_paths if sync_paths else ['.']
+
+        _local_push = os.getenv('RDX_TILT_PUSH_TO_REGISTRY') == '1'
+        _skips_local_docker = not _local_push
+        _disable_push = not _local_push
+
+        if _workloads:
+            for _wl in _workloads:
+                _wl_image = _wl.get('image', {}) or {}
+                if _wl_image.get('tag') != 'dev':
+                    continue
+                _wl_repo = _wl_image.get('repository', name)
+                _build_path = _wl.get('build_path', build_path)
+                _wl_pack_cmd = pack_cmd_base + ' --path ' + _build_path
+                custom_build(
+                    ref=_wl_repo,
+                    command=_wl_pack_cmd,
+                    deps=deps,
+                    ignore=[chart_path, 'deploy', '.rdx', 'Tiltfile'],
+                    match_in_env_vars=False,
+                    skips_local_docker=_skips_local_docker,
+                    disable_push=_disable_push,
+                    live_update=live_update_steps if live_update_steps else None,
+                )
+        else:
+            custom_build(
+                ref=name,
+                command=pack_cmd,
+                deps=deps,
+                ignore=[chart_path, 'deploy', '.rdx', 'Tiltfile'],
+                match_in_env_vars=False,
+                skips_local_docker=_skips_local_docker,
+                disable_push=_disable_push,
+                live_update=live_update_steps if live_update_steps else None,
+            )
+
+    return {
+        'builder_kind': _builder_kind,
+        'img_repo': _img_repo,
+        'img_tag': _img_tag,
+    }
+
+
+def _update_helm_deps(chart_path):
+    """Run helm dependency update for vendored sub-charts.
+
+    Handles dep filtering, repo bootstrapping, version alignment, and
+    parallel OCI pulls. Also sets watch_settings to avoid reload loops.
+    """
+    align_script_src = str(read_file('_align_subchart_versions.py'))
+    align_script_path = ('/tmp/_rdx_align_subchart_versions.' +
+                         str(hash(align_script_src) & 0x7fffffff) + '.py')
+    local('cat > ' + align_script_path + " <<'__RDX_PY_EOF__'\n" + align_script_src + "\n__RDX_PY_EOF__", echo_off=True, quiet=True)
+
+    filter_script_src = str(read_file('_filter_enabled_deps.py'))
+    filter_script_path = ('/tmp/_rdx_filter_enabled_deps.' +
+                          str(hash(filter_script_src) & 0x7fffffff) + '.py')
+    local('cat > ' + filter_script_path + " <<'__RDX_PY_EOF__'\n" + filter_script_src + "\n__RDX_PY_EOF__", echo_off=True, quiet=True)
+
+    bootstrap_repos_script_src = str(read_file('_bootstrap_helm_repos.py'))
+    bootstrap_repos_script_path = ('/tmp/_rdx_bootstrap_helm_repos.' +
+                                   str(hash(bootstrap_repos_script_src) & 0x7fffffff) + '.py')
+    local('cat > ' + bootstrap_repos_script_path + " <<'__RDX_PY_EOF__'\n" + bootstrap_repos_script_src + "\n__RDX_PY_EOF__", echo_off=True, quiet=True)
+
+    helm_dep_script = (
+        'set -e; ' +
+        'if [ -d "' + chart_path + '/charts" ]; then ' +
+        '  _need=$(mktemp); ' +
+        '  for sub in "' + chart_path + '"/charts/*/; do ' +
+        '    [ -d "$sub" ] || continue; ' +
+        '    [ -f "$sub/Chart.yaml" ] || continue; ' +
+        '    grep -q "^dependencies:" "$sub/Chart.yaml" || continue; ' +
+        '    python3 "' + filter_script_path + '" "$sub" ' +
+        '      "' + chart_path + '/values.yaml" ' +
+        '      "' + chart_path + '/.rdx/values.generated.yaml" || ' +
+        '      { echo "[rdx] FATAL: filter_enabled_deps.py failed for $sub"; exit 1; }; ' +
+        '    python3 "' + bootstrap_repos_script_path + '" "$sub" || ' +
+        '      { echo "[rdx] FATAL: bootstrap_helm_repos.py failed for $sub"; exit 1; }; ' +
+        '    if [ -f "$sub/Chart.lock" ] && [ "$sub/Chart.lock" -nt "$sub/Chart.yaml" ] && ' +
+        '       [ -d "$sub/charts" ] && [ -n "$(ls -A "$sub/charts" 2>/dev/null)" ]; then ' +
+        '      python3 "' + align_script_path + '" "$sub"; ' +
+        '    else ' +
+        '      printf "%s\\n" "$sub" >> "$_need"; ' +
+        '    fi; ' +
+        '  done; ' +
+        '  _fail=$(mktemp); rm -f "$_fail"; _n=0; ' +
+        '  while IFS= read -r sub; do ' +
+        '    [ -n "$sub" ] || continue; ' +
+        '    ( echo "[rdx] helm dep update --skip-refresh $sub"; ' +
+        '      helm dependency update --skip-refresh "$sub" && ' +
+        '      python3 "' + align_script_path + '" "$sub" || ' +
+        '      { echo "[rdx] FATAL: helm dep update/align failed for $sub" >&2; : > "$_fail"; } ' +
+        '    ) & ' +
+        '    _n=$((_n+1)); ' +
+        '    if [ "$_n" -ge 4 ]; then wait; _n=0; fi; ' +
+        '  done < "$_need"; ' +
+        '  wait; ' +
+        '  rm -f "$_need"; ' +
+        '  if [ -f "$_fail" ]; then rm -f "$_fail"; ' +
+        '    echo "[rdx] FATAL: one or more sub-chart dep updates failed" >&2; exit 1; fi; ' +
+        '  rm -f "$_fail"; ' +
+        'fi'
+    )
+    local(helm_dep_script, echo_off=True, quiet=False)
+
+    watch_settings(ignore=[
+        chart_path + '/charts/*/charts',
+        chart_path + '/charts/*/tmpcharts-*',
+        chart_path + '/charts/*/Chart.lock',
+        chart_path + '/Chart.lock',
+    ])
+
+
+def _run_dsl_projection(chart_path, _rdx_present, _stage, chart_values_files):
+    """Run `rdx render` and append the generated overlay to chart_values_files.
+
+    Returns the updated chart_values_files list.
+    """
+    if chart_values_files == None:
+        chart_values_files = [chart_path + '/values.yaml']
+
+    if _rdx_present:
+        stage_path_root = os.path.join(os.path.dirname(chart_path), '.rdx', 'stage')
+        watch_file(stage_path_root)
+        local('rdx render --stage %s' % _stage, quiet=True, echo_off=False)
+        new_overlay = chart_path + '/.rdx/values.generated.yaml'
+        old_overlay = chart_path + '/values.generated.yaml'
+        if os.path.exists(new_overlay):
+            generated_overlay = new_overlay
+        elif os.path.exists(old_overlay):
+            generated_overlay = old_overlay
+            print('rdx: note — using legacy ' + old_overlay +
+                  '. rdx-cli v0.1.38+ writes to chart/.rdx/values.generated.yaml; ' +
+                  'next `rdx render` will migrate. You can delete the legacy ' +
+                  'file once chart/.rdx/values.generated.yaml exists.')
+        else:
+            generated_overlay = ''
+        if generated_overlay != '':
+            if generated_overlay not in chart_values_files:
+                chart_values_files = chart_values_files + [generated_overlay]
+    else:
+        print('rdx: warning — `rdx` not on PATH; chart/.rdx/values.generated.yaml ' +
+              'will not be regenerated. Install rdx CLI to keep services[] DSL ' +
+              'in sync with sub-chart values. See idefxH/rdx-cli.')
+
+    return chart_values_files
+
+
+def _discover_services(parsed_values, parsed_values_paths, _lib_key):
+    """Auto-discover services from rdx-library.services[] in values.
+
+    Returns a dict mapping binding_name -> service_type.
+    """
+    def _is_overlay_path(p):
+        if not p:
+            return False
+        return (p.endswith('/.rdx/values.generated.yaml') or
+                p.endswith('/values.generated.yaml') or
+                p == '.rdx/values.generated.yaml' or
+                p == 'values.generated.yaml')
+
+    services = {}
+    all_lib_blocks = []
+    all_services_by_binding = {}
+    for i in range(len(parsed_values)):
+        cfg = parsed_values[i]
+        cfg_path = parsed_values_paths[i]
+        lib = (cfg.get(_lib_key, {}) or {}) if cfg else {}
+        all_lib_blocks.append(lib)
+        if _is_overlay_path(cfg_path):
+            continue
+        for entry in (lib.get('services') or []):
+            if entry.get('binding'):
+                all_services_by_binding[entry['binding']] = entry
+
+    def _chart_enabled(stype, binding=''):
+        for lib in all_lib_blocks:
+            if (lib.get(stype, {}) or {}).get('enabled'):
+                return True
+            if binding:
+                alias = stype + '-' + binding
+                if (lib.get(alias, {}) or {}).get('enabled'):
+                    return True
+        return False
+
+    for binding in all_services_by_binding:
+        entry = all_services_by_binding[binding]
+        stype = entry.get('type')
+        provisioning = entry.get('provisioning', '')
+        if provisioning not in ('', 'local', 'deploy'):
+            continue
+        if entry.get('enabled', True) == False:
+            continue
+        if type(stype) == "string" and "[redacted" in stype:
+            warn(("[rdx] skipping services[binding=%r]: type=%r " +
+                  "is a redacted secret marker. The DSL type should be " +
+                  "a plain string (e.g. 'grafana'). Check the bundle's " +
+                  "dsl-mappings.yaml for a values_mapping that routes " +
+                  "`services[].type` through a binding secret — that's " +
+                  "the layer to fix; the Tiltfile cannot recover a real " +
+                  "type from the redacted marker.") % (binding, stype))
+            continue
+        if not _chart_enabled(stype, binding):
+            continue
+        if stype:
+            services[binding] = stype
+
+    return services
+
+
+def _register_app_workloads(
+        name, _workloads, _lib_key, parsed_values, labels,
+        _domain_value, _app_oidc_deps, port):
+    """Register k8s_resource for app workloads (workloads[] or legacy single).
+
+    Returns None. Port is only used in legacy single-workload mode.
+    """
+    def _ingress_links(block, ingress_key='ingress', domain=''):
+        ing = block.get(ingress_key, {}) if block else {}
+        hosts = ing.get('hosts', [])
+        if not hosts:
+            if not ing.get('enabled'):
+                return []
+        scheme = 'https' if ing.get('tls') else 'http'
+        out = []
+        for h in hosts:
+            if type(h) == "string":
+                host = h
+            elif type(h) == "dict":
+                host = h.get('host', '')
+            else:
+                continue
+            if not host:
+                continue
+            if "{{" in host or "}}" in host:
+                if domain:
+                    host = host.replace("{{.domain}}", domain).replace("{{ .domain }}", domain)
+                else:
+                    continue
+            if "{{" in host or "}}" in host:
+                continue
+            out.append(link(scheme + '://' + host, host))
+        return out
+
+    if _workloads:
+        _merged_workloads = []
+        for cfg in parsed_values:
+            lib = (cfg.get(_lib_key, {}) or {}) if cfg else {}
+            wls = lib.get('workloads')
+            if wls:
+                _merged_workloads = wls
+        if not _merged_workloads:
+            _merged_workloads = _workloads
+
+        _chart_name = name
+        for cfg in parsed_values:
+            lib = (cfg.get(_lib_key, {}) or {}) if cfg else {}
+            if lib.get('name'):
+                _chart_name = lib['name']
+
+        for _wl in _merged_workloads:
+            _wl_name = _wl.get('name', 'app')
+            _wl_port = _wl.get('port')
+            _local_port = _wl.get('localPort', _wl_port)
+            _wl_links = _ingress_links(_wl, domain=_domain_value)
+            _resource_name = _chart_name + '-' + _wl_name
+            if _wl_port:
+                k8s_resource(
+                    workload=_resource_name,
+                    port_forwards='%d:%d' % (_local_port, _wl_port),
+                    labels=[labels.get(_resource_name, 'app')],
+                    links=_wl_links,
+                    resource_deps=_app_oidc_deps,
+                    auto_init=True,
+                )
+            else:
+                k8s_resource(
+                    workload=_resource_name,
+                    labels=[labels.get(_resource_name, 'app')],
+                    links=_wl_links,
+                    resource_deps=_app_oidc_deps,
+                )
+    else:
+        app_links = []
+        for cfg in parsed_values:
+            app_links.extend(_ingress_links(cfg.get(_lib_key, {}) or {}, domain=_domain_value))
+
+        k8s_resource(
+            workload=name,
+            port_forwards='%d:%d' % (port, port),
+            labels=[labels.get(name, 'app')],
+            links=app_links,
+            resource_deps=_app_oidc_deps,
+        )
+
+
+def _register_service_workloads(
+        name, namespace, services, _lib_key, parsed_values,
+        parsed_values_paths, catalogued_charts, labels,
+        _domain_value, _bootstrap_done):
+    """Register k8s_resource for each declared service, operator hooks, and port-forwards."""
+
+    def _ingress_links(block, ingress_key='ingress', domain=''):
+        ing = block.get(ingress_key, {}) if block else {}
+        hosts = ing.get('hosts', [])
+        if not hosts:
+            if not ing.get('enabled'):
+                return []
+        scheme = 'https' if ing.get('tls') else 'http'
+        out = []
+        for h in hosts:
+            if type(h) == "string":
+                host = h
+            elif type(h) == "dict":
+                host = h.get('host', '')
+            else:
+                continue
+            if not host:
+                continue
+            if "{{" in host or "}}" in host:
+                if domain:
+                    host = host.replace("{{.domain}}", domain).replace("{{ .domain }}", domain)
+                else:
+                    continue
+            if "{{" in host or "}}" in host:
+                continue
+            out.append(link(scheme + '://' + host, host))
+        return out
+
+    def _rdx_lib_block(values_dict, path_keys):
+        block = values_dict.get(_lib_key, {}) or {}
+        for key in path_keys:
+            block = (block.get(key, {}) or {}) if hasattr(block, 'get') else {}
+        return block
+
+    def workload_name_for(release, chart_alias, service_type):
+        chart_entry = catalogued_charts.get(service_type, {})
+        versions = chart_entry.get('versions', [])
+        if not versions:
+            return release + '-' + chart_alias
+        ver = versions[0]
+        if ver.get('operator_managed', False):
+            op_tpl = ver.get('operator_resource', '')
+            if op_tpl:
+                if chart_alias != service_type:
+                    op_tpl = op_tpl.replace('-' + service_type, '-' + chart_alias, 1)
+                return op_tpl.replace('{{ .Release.Name }}', release).replace('{{.Release.Name}}', release)
+        host_tpl = ver.get('service', {}).get('host', '')
+        if not host_tpl:
+            return release + '-' + chart_alias
+        if chart_alias != service_type:
+            host_tpl = host_tpl.replace('-' + service_type + '.', '-' + chart_alias + '.', 1)
+        rendered = host_tpl.replace('{{ .Release.Name }}', release).replace('{{.Release.Name}}', release)
+        if '.' in rendered:
+            rendered = rendered.split('.', 1)[0]
+        return rendered
+
+    def _bad_workload_name(s):
+        if not s or not s.strip():
+            return True
+        if '{{' in s or '}}' in s:
+            return True
+        if '[redacted' in s or 'redacted secret' in s:
+            return True
+        return False
+
+    # Compute chart aliases for multi-instance support.
+    type_counts = {}
+    for binding_name, service_type in services.items():
+        type_counts[service_type] = type_counts.get(service_type, 0) + 1
+
+    aliases = {}
+    for binding_name, service_type in services.items():
+        if type_counts[service_type] == 1:
+            aliases[binding_name] = service_type
+        else:
+            aliases[binding_name] = service_type + '-' + binding_name
+
+    # OIDC/Dex startup ordering.
+    _OIDC_PROVIDER_TYPES = ['dex']
+    _app_oidc_deps = []
+    for _oidc_binding, _oidc_type in services.items():
+        if _oidc_type not in _OIDC_PROVIDER_TYPES:
+            continue
+        _oidc_ce = catalogued_charts.get(_oidc_type, {})
+        _oidc_cvs = _oidc_ce.get('versions', [])
+        if _oidc_cvs and _oidc_cvs[0].get('operator_managed', False):
+            continue
+        _oidc_wl = workload_name_for(name, aliases[_oidc_binding], _oidc_type)
+        if _bad_workload_name(_oidc_wl):
+            continue
+        if _oidc_wl not in _app_oidc_deps:
+            _app_oidc_deps.append(_oidc_wl)
+
+    # Register CRD kinds for operator-managed charts.
+    _registered_kinds = {}
+    for _stype in services.values():
+        _ce = catalogued_charts.get(_stype, {})
+        _cvs = _ce.get('versions', [])
+        if _cvs and _cvs[0].get('operator_managed'):
+            _cr_kind_info = _cvs[0].get('cr_kind', {})
+            if _cr_kind_info:
+                _kind_key = _cr_kind_info.get('kind', '')
+                _api_ver = _cr_kind_info.get('api_version', '')
+                if _kind_key and _kind_key not in _registered_kinds:
+                    k8s_kind(_kind_key, api_version=_api_ver, pod_readiness='wait')
+                    _registered_kinds[_kind_key] = True
+
+    # Operator admission-webhook lifecycle hooks.
+    _OPERATOR_DEFAULTS = {
+        'cnpg': {
+            'webhook_service_name': 'cnpg-webhook-service',
+            'webhook_app_label': 'cloudnative-pg',
+        },
+    }
+    _op_hooks = []
+    _op_seen_types = {}
+    for _binding, _stype in services.items():
+        if _stype in _op_seen_types:
+            continue
+        _ce = catalogued_charts.get(_stype, {})
+        _cvs = _ce.get('versions', [])
+        if not _cvs:
+            continue
+        _ver = _cvs[0]
+        if not _ver.get('operator_managed'):
+            continue
+        _defaults = _OPERATOR_DEFAULTS.get(_stype, {})
+        _wh_svc = _ver.get('webhook_service_name',
+                           _defaults.get('webhook_service_name', ''))
+        if not _wh_svc:
+            continue
+        _op_seen_types[_stype] = True
+        _wh_ns = _ver.get('webhook_namespace', '') or namespace
+        _wh_label = _ver.get('webhook_app_label',
+                             _defaults.get('webhook_app_label', ''))
+        _op_res = ''
+        _op_tpl = _ver.get('operator_resource', '')
+        if _op_tpl:
+            _op_res = (_op_tpl
+                .replace('{{ .Release.Name }}', name)
+                .replace('{{.Release.Name}}', name))
+        _op_hooks.append({
+            'service_type': _stype,
+            'webhook_service_name': _wh_svc,
+            'webhook_namespace': _wh_ns,
+            'webhook_app_label': _wh_label,
+            'operator_resource': _op_res,
+            'ready_resource': name + '-' + _stype + '-webhook-ready',
+        })
+
+    _op_ready_by_type = {}
+    for _h in _op_hooks:
+        _op_ready_by_type[_h['service_type']] = _h['ready_resource']
+
+    for _hook in _op_hooks:
+        if _hook['webhook_app_label'] and not _bootstrap_done:
+            _sel = 'app.kubernetes.io/name=' + _hook['webhook_app_label']
+            local(
+                "set -e; " +
+                "for wc in " +
+                "$(kubectl get mutatingwebhookconfigurations.admissionregistration.k8s.io " +
+                "-l " + _sel + " -o name 2>/dev/null) " +
+                "$(kubectl get validatingwebhookconfigurations.admissionregistration.k8s.io " +
+                "-l " + _sel + " -o name 2>/dev/null); do " +
+                "ns=$(kubectl get \"$wc\" -o " +
+                "jsonpath='{.webhooks[0].clientConfig.service.namespace}' 2>/dev/null); " +
+                "if [ -n \"$ns\" ] && ! kubectl get namespace \"$ns\" " +
+                ">/dev/null 2>&1; then " +
+                "kubectl delete \"$wc\" --ignore-not-found >/dev/null && " +
+                "echo \"[rdx] pruned stale " + _hook['service_type'] +
+                " webhook $wc (target ns $ns missing)\"; " +
+                "fi; " +
+                "done",
+                quiet=False, echo_off=True)
+
+        _wait_deps = []
+        if _hook['operator_resource']:
+            _wait_deps = [_hook['operator_resource']]
+        local_resource(
+            _hook['ready_resource'],
+            cmd=(
+                "set -e; " +
+                "for i in $(seq 1 90); do " +
+                "ips=$(kubectl get endpoints " + _hook['webhook_service_name'] + " " +
+                "-n " + _hook['webhook_namespace'] + " " +
+                "-o jsonpath='{.subsets[*].addresses[*].ip}' " +
+                "2>/dev/null || true); " +
+                "if [ -n \"$ips\" ]; then " +
+                "echo \"[rdx] " + _hook['webhook_service_name'] +
+                " endpoints ready in " + _hook['webhook_namespace'] + ": $ips\"; " +
+                "exit 0; " +
+                "fi; " +
+                "sleep 2; " +
+                "done; " +
+                "echo \"[rdx] FATAL: " + _hook['webhook_service_name'] +
+                " has no endpoints after 180s in ns " + _hook['webhook_namespace'] + "\" >&2; " +
+                "exit 1"
+            ),
+            resource_deps=_wait_deps,
+            labels=[_hook['service_type']],
+            allow_parallel=True,
+        )
+
+    # Service port-forward registration.
+    used_local_ports = {}
+    for binding_name, service_type in services.items():
+        chart_alias = aliases[binding_name]
+        workload = workload_name_for(name, chart_alias, service_type)
+        if _bad_workload_name(workload):
+            warn(('[rdx] skipping k8s_resource for binding %r ' +
+                  '(type=%r): computed workload name %r is not a valid ' +
+                  'k8s resource name. This usually means dsl-mappings.yaml ' +
+                  'has a host/cr_object template that references a value ' +
+                  'the Tiltfile cannot resolve (e.g. a binding-secret key ' +
+                  'in `provisioning: connect` mode). Set provisioning ' +
+                  'explicitly if you meant to deploy in-cluster, or ignore ' +
+                  'this warning if Tilt auto-discovers the workload.') %
+                 (binding_name, service_type, workload))
+            continue
+
+        svc_port = 0
+        chart_entry = catalogued_charts.get(service_type, {})
+        chart_versions = chart_entry.get('versions', [])
+
+        _ingress_vm = (chart_versions[0].get('values_mapping', {}) or {}).get('ingress.enabled', '') if chart_versions else ''
+        if _ingress_vm:
+            _segs = _ingress_vm.split('.')
+            ingress_path = _segs[1:-1] if len(_segs) > 2 else ['ingress']
+        else:
+            ingress_path = ['ingress']
+        svc_links = []
+        for cfg in parsed_values:
+            parent = _rdx_lib_block(cfg, [chart_alias] + ingress_path[:-1])
+            svc_links.extend(_ingress_links(parent, ingress_path[-1], domain=_domain_value))
+        is_operator_managed = False
+        pod_selector = {}
+        cr_object = ''
+        operator_resource = ''
+        if chart_versions:
+            svc_spec = chart_versions[0].get('service', {})
+            svc_port = svc_spec.get('port', 0)
+            is_operator_managed = chart_versions[0].get('operator_managed', False)
+            raw_selector = chart_versions[0].get('pod_selector', {})
+            for sel_k, sel_v in raw_selector.items():
+                pod_selector[sel_k] = sel_v.replace('{{ .Release.Name }}', name).replace('{{.Release.Name}}', name)
+            raw_cr = chart_versions[0].get('cr_object', '')
+            if raw_cr:
+                cr_object = raw_cr.replace('{{ .Release.Name }}', name).replace('{{.Release.Name}}', name)
+            raw_op = chart_versions[0].get('operator_resource', '')
+            if raw_op:
+                operator_resource = raw_op.replace('{{ .Release.Name }}', name).replace('{{.Release.Name}}', name)
+            if not svc_port and svc_spec.get('ports'):
+                for pname, pspec in svc_spec['ports'].items():
+                    if pspec.get('primary', False):
+                        svc_port = pspec.get('port', 0)
+                        break
+                if not svc_port:
+                    for pname, pspec in svc_spec['ports'].items():
+                        svc_port = pspec.get('port', 0)
+                        break
+
+        if is_operator_managed and cr_object:
+            cr_name = cr_object.split(':')[0]
+            if _bad_workload_name(cr_name):
+                warn(('[rdx] skipping k8s_resource for operator CR ' +
+                      'of binding %r (type=%r): computed cr_name %r is ' +
+                      'not a valid k8s resource name. The CRD entry in ' +
+                      'dsl-mappings.yaml has a `cr_object` template the ' +
+                      'Tiltfile cannot resolve.') %
+                     (binding_name, service_type, cr_name))
+                continue
+            resource_kwargs = {
+                'workload': cr_name,
+                'labels': [labels.get(workload, 'services')],
+                'links': svc_links,
+            }
+            if pod_selector:
+                resource_kwargs['extra_pod_selectors'] = [pod_selector]
+            _cr_deps = []
+            if operator_resource:
+                _cr_deps.append(operator_resource)
+            _wh_ready = _op_ready_by_type.get(service_type, '')
+            if _wh_ready:
+                _cr_deps.append(_wh_ready)
+            if _cr_deps:
+                resource_kwargs['resource_deps'] = _cr_deps
+            if svc_port:
+                local_port = svc_port
+                if local_port < 1024:
+                    local_port = svc_port + 10000
+                while local_port in used_local_ports:
+                    local_port += 1
+                used_local_ports[local_port] = True
+                resource_kwargs['port_forwards'] = '%d:%d' % (local_port, svc_port)
+            k8s_resource(**resource_kwargs)
+        elif svc_port:
+            local_port = svc_port
+            if local_port < 1024:
+                local_port = svc_port + 10000
+            while local_port in used_local_ports:
+                local_port += 1
+            used_local_ports[local_port] = True
+            k8s_resource(
+                workload=workload,
+                port_forwards='%d:%d' % (local_port, svc_port),
+                labels=[labels.get(workload, 'services')],
+                links=svc_links,
+            )
+        else:
+            k8s_resource(
+                workload=workload,
+                labels=[labels.get(workload, 'services')],
+                links=svc_links,
+            )
+
+    return _app_oidc_deps
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# rdx_app() — orchestrator
+# ═══════════════════════════════════════════════════════════════════════
+
 def rdx_app(
         name,
         language=None,
@@ -784,295 +1756,22 @@ def rdx_app(
             fail('rdx_app: unsupported language %r. Supported: %s' % (
                 language, ', '.join(sorted(LANGUAGE_DEFAULTS.keys()))))
 
-    # Auto-detect chart_path when caller didn't pass one. Prefer deploy/
-    # (bundle template 0.11.13+ scaffolds) and fall back to chart/ (older
-    # scaffolds). Project Tiltfiles that pass chart_path='chart' or
-    # chart_path='deploy' explicitly bypass this — explicit always wins.
-    # Final fallback to 'chart' for projects with neither directory yet
-    # (preserves the historical default so existing tests / fixtures keep
-    # working).
-    # Note: Tilt's Starlark `os.path` exposes `exists()` but NOT `isdir()`
-    # (verified at runtime — the latter raises 'module has no .isdir field
-    # or method'). We probe for `<dir>/Chart.yaml` instead, which is a
-    # tighter signal anyway: a deploy/ or chart/ that doesn't carry a
-    # Chart.yaml is useless to helm regardless of its directory-ness.
-    if chart_path == None:
-        if os.path.exists('deploy/Chart.yaml'):
-            chart_path = 'deploy'
-        elif os.path.exists('chart/Chart.yaml'):
-            chart_path = 'chart'
-        else:
-            chart_path = 'chart'
-
-    # ─── Library values key detection ──────────────────────────────────
-    # Every read of the project's DSL nests under this key. Detect it from
-    # the vendored library dependency rather than assuming a fixed name —
-    # bundles ship the library chart under different names and a hardcoded
-    # key silently reads nothing (no services discovered, no charts kept by
-    # the dep filter, wrong workload names).
-    _lib_key = _detect_lib_key(chart_path)
-
-    # ─── Stage auto-detection ──────────────────────────────────────────
-    # Resolve the RDX stage once, used by every `rdx render --stage`
-    # call below. Priority:
-    #   1. RDX_STAGE env var (explicit override, e.g. CI).
-    #   2. .rdx/stage file at the project root (written by `rdx stage`).
-    #   3. Fallback to 'dev' (safe default for inner-loop).
-    _stage = os.getenv('RDX_STAGE', '')
-    if not _stage:
-        _stage_file = os.path.join(chart_path, '..', '.rdx', 'stage')
-        if os.path.exists(_stage_file):
-            _stage = str(read_file(_stage_file)).strip()
-    if not _stage:
-        _stage = 'dev'
+    # Phase 1: Resolve chart path, library key, and stage.
+    _ctx = _resolve_chart_and_stage(name, chart_path)
+    chart_path = _ctx['chart_path']
+    _lib_key = _ctx['lib_key']
+    _stage = _ctx['stage']
 
     labels = ui_labels or {}
 
-    # ─── Namespace + pullsecret mirror (must run EARLY) ─────────────────
-    # Resolve the deploy namespace, ensure it exists, and mirror the
-    # application-collection imagePullSecret BEFORE any image builds are
-    # registered or `helm dep update` work begins. Two reasons:
-    #
-    #   1. Race window: registering custom_build / k8s_yaml later in this
-    #      function queues those for Tilt's reconciler. Pods that pull
-    #      from dp.apps.rancher.io land on ImagePullBackOff if the secret
-    #      isn't already in the target NS the moment kubelet first sees
-    #      the pod spec. With this block at the bottom of the function,
-    #      slow `helm dep update` runs left a window where pods could be
-    #      scheduled before kubectl finished the mirror. The e2e harness
-    #      worked around this by pre-creating namespaces (and the secret)
-    #      itself — that workaround can go away now that the mirror runs
-    #      before any workload registration in this function.
-    #
-    #   2. Same `local()` calls, same logic — only the position moved.
-    #      Functionally identical for the single-NS case; the win is the
-    #      ordering guarantee versus image-build / k8s_yaml registration
-    #      below.
-    #
-    # Namespace expansion: shell out to `rdx namespace expand` (single
-    # source of truth, rdx-cli 0.1.47+), with a Starlark fallback for
-    # older rdx binaries. Reads `.rdx/project.yaml` namespace.local,
-    # substitutes {{.project}} / {{.user}}.
-    # Probe for the rdx binary once per rdx_app() call and reuse the result
-    # at every downstream site (namespace expansion here, `rdx render`
-    # later). A single shell-out reports both whether rdx is on PATH and
-    # whether it understands the `namespace` subcommand (rdx-cli 0.1.47+,
-    # which owns canonical namespace expansion), so we don't pay for
-    # repeated blocking probes on every Tiltfile re-eval.
-    # One shell round-trip does three things that used to be two separate
-    # forks every reload (issue #7 #2+#3, H3): probe rdx presence + the
-    # `namespace` subcommand, then expand the namespace — with the
-    # expansion cached to /tmp so steady-state reloads skip the
-    # `rdx namespace expand` fork entirely (issue #7 M2). The cache is
-    # keyed on the project directory (cksum of $PWD, so co-located
-    # projects don't collide) and invalidated whenever .rdx/project.yaml
-    # is newer than the cache file — that file plus $USER (process-stable)
-    # are the only inputs the expansion depends on. The same shell also
-    # folds in the bootstrap-liveness probe (issue #7 #4, H3): when the
-    # namespace is known it checks the sentinel + `kubectl get namespace`
-    # in-line, so the common path no longer pays a separate cluster
-    # round-trip on every reload to compute _bootstrap_done below. Emits
-    # four newline-separated fields (newlines, not spaces, so the possibly
-    # empty namespace field keeps its position): present, can_expand,
-    # namespace, bootstrap_done.
-    _rdx_probe = str(local(
-        'if command -v rdx > /dev/null 2>&1; then _p=yes; else _p=no; fi; ' +
-        'if [ "$_p" = yes ] && rdx namespace --help > /dev/null 2>&1; ' +
-        'then _c=yes; else _c=no; fi; ' +
-        '_ns=""; ' +
-        'if [ "$_c" = yes ]; then ' +
-        '  _ck=/tmp/rdx-nsexpand-$(pwd | cksum | cut -d" " -f1); ' +
-        '  if [ -f "$_ck" ] && [ "$_ck" -nt .rdx/project.yaml ]; then ' +
-        '    _ns=$(cat "$_ck"); ' +
-        '  else ' +
-        '    _ns=$(rdx namespace expand) && printf "%s" "$_ns" > "$_ck"; ' +
-        '  fi; ' +
-        'fi; ' +
-        '_bd=no; ' +
-        'if [ -n "$_ns" ] && [ -f /tmp/rdx-"$_ns"-bootstrapped ] && ' +
-        '   kubectl get namespace "$_ns" > /dev/null 2>&1 && ' +
-        '   ([ "${RDX_SKIP_PULLSECRET_MIRROR:-0}" = "1" ] || kubectl get secret -n "$_ns" application-collection > /dev/null 2>&1); ' +
-        'then _bd=yes; fi; ' +
-        'printf "%s\\n%s\\n%s\\n%s\\n" "$_p" "$_c" "$_ns" "$_bd"',
-        quiet=True, echo_off=True)).strip().split('\n')
-    _rdx_present = len(_rdx_probe) > 0 and _rdx_probe[0] == 'yes'
-    _rdx_can_expand = len(_rdx_probe) > 1 and _rdx_probe[1] == 'yes'
-    _probe_bootstrap_done = len(_rdx_probe) > 3 and _rdx_probe[3] == 'yes'
-    if _rdx_can_expand:
-        namespace = _rdx_probe[2] if len(_rdx_probe) > 2 else ''
-        if not namespace:
-            fail('rdx_app: `rdx namespace expand` returned empty output. Check `.rdx/project.yaml`.')
-    else:
-        # Legacy fallback: in-Tiltfile expander (kept simple — covers UC1
-        # and UC2 patterns; for richer cases the user should upgrade to
-        # rdx-cli 0.1.47+ which owns the canonical logic).
-        project_meta = read_yaml('.rdx/project.yaml', default={})
-        ns_template = ((project_meta.get('namespace', {}) or {}).get('local', '') or '{{.project}}')
-        user_value = str(local('echo "${USER:-default}"', quiet=True, echo_off=True)).strip() or 'default'
-        namespace = ns_template
-        for token, value in [('{{.project}}', name), ('{{ .project }}', name),
-                             ('{{.user}}', user_value), ('{{ .user }}', user_value)]:
-            namespace = namespace.replace(token, value)
-        if '{{' in namespace or '}}' in namespace:
-            fail((
-                'rdx_app: namespace template %r contains an unrecognised token ' +
-                'after expansion (got %r). Allowed tokens: {{.project}}, {{.user}}. ' +
-                'Edit .rdx/project.yaml namespace.local to fix, or install rdx 0.1.47+ ' +
-                'so this extension can shell out to `rdx namespace expand` instead.'
-            ) % (ns_template, namespace))
+    # Phase 2: Bootstrap namespace (resolve, create, mirror pull-secret).
+    _ns_ctx = _bootstrap_namespace(name, chart_path, _lib_key)
+    namespace = _ns_ctx['namespace']
+    _rdx_present = _ns_ctx['rdx_present']
+    _rdx_can_expand = _ns_ctx['rdx_can_expand']
+    _bootstrap_done = _ns_ctx['bootstrap_done']
 
-    # ─── One-shot bootstrap guard ──────────────────────────────────────
-    # Namespace creation and the pull-secret mirror below only need to run
-    # once per session, but Tilt re-evaluates this whole Tiltfile on every
-    # file save. Gate the blocking kubectl round-trips behind a /tmp
-    # sentinel so steady-state reloads skip them (~7 cluster API calls per
-    # reload otherwise). The sentinel lives in /tmp, so a reboot — a
-    # genuinely fresh session — starts clean.
-    #
-    # The sentinel isn't trusted blindly: one `kubectl get namespace`
-    # doubles as a liveness probe, so if the namespace is torn down
-    # out-of-band the next re-eval rebuilds it (and re-mirrors the secret).
-    # That single call replaces the handful the full bootstrap makes.
-    _bootstrap_sentinel = '/tmp/rdx-' + namespace + '-bootstrapped'
-    if _rdx_can_expand:
-        # Common path: the probe shell already evaluated the sentinel +
-        # liveness against this exact namespace, so reuse it — no extra
-        # cluster round-trip on every reload.
-        _bootstrap_done = _probe_bootstrap_done
-    else:
-        # Legacy fallback path: namespace came from the Starlark expander,
-        # not the probe shell, so run the liveness check here.
-        _bootstrap_done = os.path.exists(_bootstrap_sentinel) and str(local(
-            'kubectl get namespace ' + namespace +
-            ' > /dev/null 2>&1 && ' +
-            '([ "${RDX_SKIP_PULLSECRET_MIRROR:-0}" = "1" ] || ' +
-            'kubectl get secret -n ' + namespace + ' application-collection > /dev/null 2>&1) && ' +
-            'echo yes || echo no',
-            quiet=True, echo_off=True)).strip() == 'yes'
-
-    # One concise banner on the cold path so the bootstrap work below reads
-    # as intentional progress rather than a wall of shell output (issue #7
-    # L1). Steady-state reloads — where _bootstrap_done is true and the
-    # idempotent steps below are skipped/silent — stay quiet.
-    if not _bootstrap_done:
-        print('rdx: first-run bootstrap for namespace ' + namespace +
-              ' (namespace + pull-secret + charts)…')
-
-    # Pre-create the namespace idempotently. Tilt invokes `helm template`
-    # (not `helm install --create-namespace`) so the namespace must exist
-    # before k8s_yaml applies the rendered manifests. `kubectl create
-    # --dry-run=client | kubectl apply` is idempotent — succeeds whether
-    # the namespace is new or already there.
-    if not _bootstrap_done:
-        local(
-            'kubectl create namespace ' + namespace +
-            ' --dry-run=client -o yaml | kubectl apply -f -',
-            quiet=True, echo_off=True)
-
-    # Mirror the application-collection imagePullSecret from `default` to
-    # the deploy namespace if it's missing. Background:
-    #   - The Application Collection Rancher Desktop extension installs
-    #     the Secret in `default` only. With NS Phase A (rdx 0.1.43+),
-    #     every project deploys to its own namespace (`{{.project}}` or
-    #     a multi-dev `{{.project}}-{{.user}}` template), so the Secret
-    #     is never automatically present where it's needed.
-    #   - The pod's spec carries `imagePullSecrets: [application-collection]`
-    #     unconditionally. Without the Secret in NS, kubelet logs
-    #     `Unable to retrieve some image pull secrets`. App image pulls
-    #     from dp.apps.rancher.io (BCI base, SUSE subchart images) all
-    #     fail with ImagePullBackOff — locally Tilt can mask this by
-    #     building images itself, but any real subchart pull cracks open.
-    #
-    # Strategy:
-    #   1. If the target NS already has the Secret → skip silently.
-    #   2. Else if `default` has it → kubectl get -o yaml | sed | apply.
-    #      Strips namespace + cluster-bound metadata so apply lands in
-    #      the new ns. Idempotent (apply, not create).
-    #   3. Else loud failure with the remediation hint pointing at
-    #      `helm registry login` + the SUSE extension docs.
-    #
-    # Three escape hatches to coexist with operator-managed distribution
-    # (kubernetes-reflector / External Secrets / GitOps / manual):
-    #
-    #   1. Env var RDX_SKIP_PULLSECRET_MIRROR=1 (cluster-wide).
-    #   2. Namespace label rdx.suse.com/pullsecret-managed-by=operator
-    #      — set this on a project NS to declare "an operator owns the
-    #      pullsecret here, hands off". Per-NS, persistent in YAML.
-    #   3. Source-side annotation: if Secret/application-collection in
-    #      `default` carries `external-secrets.io/owned-by` or
-    #      `reflector.v1.k8s.emberstack.com/reflection-allowed=true` we
-    #      take that as proof an operator distributes it and we step
-    #      back — letting the operator's controller reconcile in its
-    #      own time on the project NS.
-    #
-    # Step 0 (target-NS already has it) is the universal safety net:
-    # whatever distribution mechanism wrote it first, we don't touch.
-    if not _bootstrap_done and os.getenv('RDX_SKIP_PULLSECRET_MIRROR', '') != '1':
-        local(
-            "set -e; " +
-            # Step 0: target NS already has the Secret — done.
-            "if kubectl get secret -n " + namespace + " application-collection " +
-            ">/dev/null 2>&1; then exit 0; fi; " +
-            # Step 0b: target NS is operator-managed via label.
-            "if [ \"$(kubectl get ns " + namespace + " -o " +
-            "jsonpath='{.metadata.labels.rdx\\.io/pullsecret-managed-by}' " +
-            "2>/dev/null)\" = 'operator' ]; then " +
-            "echo '[rdx] skipping pullsecret mirror " +
-            "(ns " + namespace + " labelled rdx.suse.com/pullsecret-managed-by=operator)'; " +
-            "exit 0; fi; " +
-            # Step 0c: source Secret is operator-managed (ESO / reflector).
-            # Don't fight the operator — step back and let its controller
-            # propagate to the project NS on its own.
-            "if [ -n \"$(kubectl get secret -n default application-collection -o " +
-            "jsonpath='{.metadata.annotations.external-secrets\\.io/owned-by}' " +
-            "2>/dev/null)\" ]; then " +
-            "echo '[rdx] skipping pullsecret mirror " +
-            "(default Secret has external-secrets.io annotation; ESO will distribute)'; " +
-            "exit 0; fi; " +
-            "if [ \"$(kubectl get secret -n default application-collection -o " +
-            "jsonpath='{.metadata.annotations.reflector\\.v1\\.k8s\\.emberstack\\.com/reflection-allowed}' " +
-            "2>/dev/null)\" = 'true' ]; then " +
-            "echo '[rdx] skipping pullsecret mirror " +
-            "(default Secret has reflector annotation; kubernetes-reflector will distribute)'; " +
-            "exit 0; fi; " +
-            # Step 1: source missing — loud fail.
-            "if ! kubectl get secret -n default application-collection " +
-            ">/dev/null 2>&1; then " +
-            "echo '[rdx] FATAL: Secret/application-collection not found " +
-            "in `default` (the SUSE Rancher Desktop extension would normally " +
-            "install it there). Either install/launch the SUSE extension, " +
-            "OR run `helm registry login dp.apps.rancher.io` then bootstrap " +
-            "the Secret manually via kubectl create secret docker-registry; " +
-            "OR set RDX_SKIP_PULLSECRET_MIRROR=1 if your cluster uses " +
-            "kubernetes-reflector / External Secrets to distribute it.' >&2; " +
-            "exit 1; fi; " +
-            # sed strips instance-bound metadata (namespace + uid +
-            # resourceVersion + creationTimestamp) so the doc is
-            # namespace-portable. kubectl apply -n <target> then anchors
-            # it to the deploy NS. No jq dep — macOS doesn't ship one.
-            "kubectl get secret -n default application-collection -o yaml | " +
-            "sed -e '/^  namespace:/d' " +
-            "-e '/^  uid:/d' " +
-            "-e '/^  resourceVersion:/d' " +
-            "-e '/^  creationTimestamp:/d' | " +
-            "kubectl apply -n " + namespace + " -f - >/dev/null && " +
-            "echo '[rdx] mirrored Secret/application-collection " +
-            "default -> " + namespace + "'",
-            quiet=False, echo_off=True)
-
-    # Record that this namespace was bootstrapped so subsequent reloads
-    # skip the work above. Touched on the cold path regardless of whether
-    # the mirror ran (RDX_SKIP_PULLSECRET_MIRROR=1 / operator-managed
-    # clusters still want the skip on later reloads).
-    if not _bootstrap_done:
-        local('touch ' + _bootstrap_sentinel, quiet=True, echo_off=True)
-
-    # ─── Workloads[] detection ──────────────────────────────────────────
-    # New DSL (bundle v0.11+): `rdx-library.workloads[]` array in
-    # values.yaml. Each workload carries its own image, port, ingress,
-    # shape. When present, custom_build and k8s_resource iterate the
-    # array; when absent, we fall back to the legacy single-image mode
-    # so projects that haven't migrated keep working.
+    # Phase 3: Read early values for workloads detection.
     _primary_values_file = chart_path + '/values.yaml'
     if chart_values_files != None and len(chart_values_files) > 0:
         _primary_values_file = chart_values_files[0]
@@ -1080,635 +1779,30 @@ def rdx_app(
     _early_lib = (_early_values.get(_lib_key, {}) or {})
     _workloads = _early_lib.get('workloads') or []
 
-    # ─── Image strategy: pack build / pre-built image / helm-only ───
-    # Track the resolved builder family across the function. Set in the
-    # pack-build branch below; stays None for helm_only / image_ref
-    # deploys (where no builder runs). Read at the helm() step to decide
-    # the BCI live-update runAsUser fix.
-    _builder_kind = None
-    if helm_only:
-        pass
-    elif image_ref:
-        # Pre-built image: parse registry/repo:tag and pass to helm.
-        # No pack build, no custom_build. Tilt just deploys the image.
-        if ':' in image_ref:
-            _img_repo, _img_tag = image_ref.rsplit(':', 1)
-        else:
-            _img_repo = image_ref
-            _img_tag = 'latest'
-    else:
-        defaults = LANGUAGE_DEFAULTS[language]
+    # Phase 4: Resolve image strategy and register custom_build resources.
+    _img_ctx = _resolve_image_strategy(
+        name, language, builder, builder_image, extra_buildpacks,
+        additional_env, live_reload, node_version, bp_log_level,
+        image_labels, runtime_cert_binding, debug, debug_port,
+        live_update_paths, image_ref, helm_only, build_path,
+        chart_path, _lib_key, _workloads, _early_values, _early_lib)
+    _builder_kind = _img_ctx['builder_kind']
 
-        # Resolve the builder family. Precedence, highest first:
-        #   1. explicit builder= argument
-        #   2. values.yaml `build.builder`
-        #   3. machine default_builder from ~/.config/rdx/config.yaml
-        #   4. 'heroku'
-        # The selector is a shorthand ('heroku' -> DEFAULT_BUILDER,
-        # 'bci' -> BCI_BUILDER) or, for anything else, a raw CNB builder
-        # image used as-is. `builder_image` is a final raw override on top.
-        _builder_sel = builder
-        if _builder_sel == None or _builder_sel == '':
-            # `build.builder` may sit top-level or nested under the lib key,
-            # depending on how the project authored values.yaml. Check both.
-            _values_build = (_early_values.get('build', {}) or {}).get('builder')
-            if _values_build == None or _values_build == '':
-                _values_build = (_early_lib.get('build', {}) or {}).get('builder')
-            _builder_sel = _values_build
-        if _builder_sel == None or _builder_sel == '':
-            _builder_sel = _RDX_DEFAULT_BUILDER
-        if _builder_sel == None or _builder_sel == '':
-            _builder_sel = 'heroku'
+    # Phase 5: Update helm dependencies.
+    _update_helm_deps(chart_path)
 
-        if _builder_sel in BUILDER_IMAGES:
-            # Known shorthand: normalize the kind and map to its image.
-            _builder_kind = _builder_sel
-            _resolved_builder = BUILDER_IMAGES[_builder_sel]
-        else:
-            # Unrecognized selector: treat it as a raw builder image and use
-            # it as-is. _builder_kind stays the raw string, so the bci-only
-            # branches below (each gated on `== 'bci'`) don't fire and the
-            # caller owns the buildpack/runtime semantics.
-            _builder_kind = _builder_sel
-            _resolved_builder = _builder_sel
-        builder = builder_image or _resolved_builder
-
-        # Normalize a raw BCI builder image (raw selector or builder_image
-        # override) to kind 'bci' so the bci-only branches below fire — no
-        # heroku/* buildpacks, named-volume cache, runAsUser fix. Keyed on the
-        # final resolved image, so a builder_image override pointing at BCI is
-        # caught even when the selector was heroku. See _is_bci_builder_image.
-        if _builder_kind != 'bci' and _is_bci_builder_image(builder):
-            _builder_kind = 'bci'
-
-        # Resolve the buildpack list. The BCI builder bundles multiple
-        # versions of each Paketo buildpack, so naming one without a version
-        # is ambiguous and `pack` refuses to build. Instead let the builder's
-        # built-in detection order resolve the language buildpacks
-        # (node-engine -> npm-install -> procfile, and the equivalents for
-        # other languages). Only caller-supplied extra_buildpacks are passed
-        # explicitly, with whatever version the caller pins.
-        if _builder_kind == 'bci':
-            buildpacks = list(extra_buildpacks)
-        else:
-            buildpacks = defaults['buildpacks'] + extra_buildpacks
-
-        # The Paketo BP_*/BPE_* convenience knobs only affect the BCI
-        # builder. Warn once (rather than baking no-op env layers) when any
-        # are set for a non-bci builder, then ignore them below.
-        _reload_supported = bool(defaults.get('bci_reload'))
-        # Default live_reload ON for the BCI builder (its Paketo buildpacks
-        # ship watchexec) on languages that support it; OFF otherwise — the
-        # heroku path reloads via the Procfile `dev:` process and compiled
-        # languages rebuild via pack. An explicit live_reload= always wins.
-        if live_reload == None:
-            live_reload = (_builder_kind == 'bci' and _reload_supported)
-        if _builder_kind != 'bci':
-            _bci_only_knobs = []
-            if live_reload:
-                _bci_only_knobs.append('live_reload')
-            if node_version != None:
-                _bci_only_knobs.append('node_version')
-            if bp_log_level != None:
-                _bci_only_knobs.append('bp_log_level')
-            if image_labels != None:
-                _bci_only_knobs.append('image_labels')
-            if runtime_cert_binding != None:
-                _bci_only_knobs.append('runtime_cert_binding')
-            if debug:
-                _bci_only_knobs.append('debug')
-            if _bci_only_knobs:
-                print('rdx: warning — ' + ', '.join(_bci_only_knobs) +
-                      ' only affect the BCI builder (Paketo BP_*/BPE_* knobs); ' +
-                      'ignored for builder=' + repr(_builder_kind) + '. The ' +
-                      'heroku path already live-reloads via the Procfile `dev:` ' +
-                      'process (nodemon).')
-        elif live_reload and not _reload_supported:
-            # builder='bci' but this language's buildpack contributes no
-            # watchexec `reload` process (e.g. go-build). Don't bake a dead
-            # BP_LIVE_RELOAD layer or select a non-existent `reload` process
-            # (which would hard-fail pack build) — warn and fall back to the
-            # full layer-cached rebuild.
-            print('rdx: warning — live_reload=True ignored for language ' +
-                  repr(language) + ' on the BCI builder: its buildpack ' +
-                  'contributes no watchexec `reload` process. Source changes ' +
-                  'trigger a full (layer-cached) pack rebuild.')
-
-        # Preflight: the BCI builder lives in a private registry, so `pack`
-        # must be able to pull it (and its run image) with local ghcr.io
-        # credentials. Warn — don't hard-fail — because credential helpers
-        # (osxkeychain, ecr-login) store auth outside ~/.docker/config.json
-        # where this cheap grep can't see it. Set RDX_SKIP_GHCR_CHECK=1 to
-        # silence. The actual pull failure (if any) surfaces with a clear
-        # 401 from pack itself.
-        if _builder_kind == 'bci' and os.getenv('RDX_SKIP_GHCR_CHECK', '') != '1':
-            local(
-                "if [ -f \"$HOME/.docker/config.json\" ] && " +
-                "grep -q 'ghcr.io' \"$HOME/.docker/config.json\" 2>/dev/null; then exit 0; fi; " +
-                "echo '[rdx] WARN: no ghcr.io entry in ~/.docker/config.json. " +
-                "The BCI builder (" + builder + ") is in a private registry; " +
-                "run `docker login ghcr.io` if `pack build` fails to pull it. " +
-                "Set RDX_SKIP_GHCR_CHECK=1 to silence this check.' >&2",
-                quiet=False, echo_off=True)
-
-        sync_paths = live_update_paths if live_update_paths != None else defaults['live_update_paths']
-
-        # Cache flags differ by builder. The heroku/* lifecycle accepts a
-        # host bind-mount cache (format=bind;source=<dir>), giving a stable
-        # on-disk cache under /tmp that survives `pack` invocations.
-        #
-        # The Paketo lifecycle shipped in the BCI builder does NOT support
-        # bind caches the same way: it stats /cache inside an ephemeral
-        # exporter helper and bails with
-        #   [exporter] ERROR: failed to create volume cache:
-        #              stat /cache: no such file or directory
-        # so for any non-heroku builder we use a NAMED Docker volume
-        # (format=volume;name=<vol>). The Paketo lifecycle creates the
-        # volume on first build and reuses it on subsequent builds, giving
-        # the same persistent-cache speed-up the bind cache gives heroku.
-        cache_dir = '/tmp/rdx-pack-cache-' + name
-        cache_vol = 'rdx-pack-cache-' + name
-        pack_args = ['pack', 'build', '$EXPECTED_REF']
-        if _builder_kind == 'heroku':
-            pack_args.extend([
-                '--cache', '"type=build;format=bind;source=' + cache_dir + '"',
-                '--cache', '"type=launch;format=bind;source=' + cache_dir + '-launch"',
-            ])
-        else:
-            pack_args.extend([
-                '--cache', '"type=build;format=volume;name=' + cache_vol + '"',
-                '--cache', '"type=launch;format=volume;name=' + cache_vol + '-launch"',
-            ])
-        pack_args.extend(['--builder', builder])
-        for bp in buildpacks:
-            pack_args.extend(['--buildpack', bp])
-        for k, v in additional_env.items():
-            pack_args.extend(['--env', '%s=%s' % (k, v)])
-        # Default process selection. With builder='bci' + live_reload, the
-        # watchexec-wrapped process is the language buildpack's own `web`
-        # (npm-start et al. wrap `web` when BP_LIVE_RELOAD_ENABLED=true), so
-        # we select `web`. There is NO `reload` process — selecting one would
-        # hard-fail the build. The Procfile (which would clobber `web` with a
-        # plain command) is excluded from the build context below. Otherwise
-        # fall back to the language's Procfile-gated default ('dev:' nodemon).
-        _reload_proc = None
-        if _builder_kind == 'bci':
-            _reload_proc = _bci_reload_default_process(live_reload, _reload_supported)
-        if _reload_proc:
-            pack_args.extend(['--default-process', _reload_proc])
-        else:
-            dev_proc = defaults.get('pack_default_process')
-            if dev_proc:
-                # Only pass --default-process if the Procfile actually declares
-                # that process name. Brownfield apps typically only have 'web:';
-                # forcing 'dev' would crash pack build with "tried to set dev to
-                # default but it doesn't exist".
-                _procfile_path = build_path + '/Procfile'
-                _has_dev_proc = False
-                if os.path.exists(_procfile_path):
-                    _pf_content = str(read_file(_procfile_path))
-                    for _pf_line in _pf_content.splitlines():
-                        if _pf_line.startswith(dev_proc + ':'):
-                            _has_dev_proc = True
-                            break
-                if _has_dev_proc:
-                    pack_args.extend(['--default-process', dev_proc])
-        for k, v in (defaults.get('pack_build_env') or {}).items():
-            pack_args.extend(['--env', '%s=%s' % (k, v)])
-        # Builder-specific env (e.g. Paketo BP_* knobs for the BCI builder)
-        # layered on top of the language defaults above.
-        for k, v in (BUILDER_BUILD_ENV.get(_builder_kind, {}).get(language, {}) or {}).items():
-            pack_args.extend(['--env', '%s=%s' % (k, v)])
-        # Dynamic Paketo BP_*/BPE_* knobs derived from rdx_app() arguments
-        # (live_reload, node_version, image_labels, debug, ...). BCI only;
-        # see _resolve_bci_build_env. Applied last so the curated knobs win
-        # on a key clash with additional_env / BUILDER_BUILD_ENV.
-        if _builder_kind == 'bci':
-            _bci_env = _resolve_bci_build_env(
-                language, live_reload, _reload_supported, node_version,
-                bp_log_level, image_labels, runtime_cert_binding,
-                debug, debug_port)
-            for k, v in _bci_env.items():
-                # custom_build runs this command through a shell, so a value
-                # with spaces (BP_IMAGE_LABELS is space-delimited key=value
-                # pairs) would split into extra tokens — `team=platform`
-                # becomes a stray positional arg to pack. Wrap such values in
-                # double quotes (matching the --cache quoting style above) so
-                # the shell keeps them as one argument. Keys/values must not
-                # themselves contain a double quote.
-                if ' ' in str(v):
-                    pack_args.extend(['--env', '%s="%s"' % (k, v)])
-                else:
-                    pack_args.extend(['--env', '%s=%s' % (k, v)])
-        # Procfile exclusion for builder='bci' + live_reload. The BCI
-        # builder's procfile buildpack runs after npm-start and a `web:`
-        # Procfile entry OVERWRITES npm-start's watchexec-wrapped `web` with
-        # a plain command — killing live reload. Exclude the Procfile from
-        # the build context via a pack project descriptor so the procfile
-        # buildpack detects nothing and the watchexec `web` survives. Skip
-        # (with a warning) when the project already ships its own
-        # project.toml, so we never clobber a user descriptor.
-        _excl_action = _bci_procfile_exclude_action(
-            _builder_kind, live_reload, _reload_supported,
-            os.path.exists(build_path + '/Procfile'),
-            os.path.exists(build_path + '/project.toml'))
-        if _excl_action == 'exclude':
-            _descriptor_path = '/tmp/rdx-pack-descriptor-' + name + '.toml'
-            _descriptor_content = '\n'.join([
-                '# Generated by tilt-extension-rdx (builder=bci, live_reload=True).',
-                '# Excludes the Procfile so heroku/procfile-style process types',
-                "# don't overwrite Paketo npm-start's watchexec-wrapped `web`.",
-                '[_]',
-                'schema-version = "0.2"',
-                '',
-                '[io.buildpacks]',
-                'exclude = ["Procfile"]',
-                '',
-            ])
-            # Write at eval time (re-run on every Tiltfile reload — idempotent)
-            # so the descriptor exists when custom_build later invokes pack.
-            local(
-                "cat > '" + _descriptor_path + "' <<'RDXEOF'\n" +
-                _descriptor_content + "RDXEOF\n",
-                quiet=True, echo_off=True)
-            pack_args.extend(['--descriptor', _descriptor_path])
-        elif _excl_action == 'warn':
-            print('rdx: warning — live_reload=True with builder=bci, but ' +
-                  build_path + '/project.toml exists, so the Procfile is NOT ' +
-                  'excluded from the build. The procfile buildpack will ' +
-                  "overwrite Paketo's watchexec-wrapped `web` process and live " +
-                  'reload will not take effect. Add `exclude = ["Procfile"]` ' +
-                  'under [io.buildpacks] in your project.toml to enable it.')
-
-        # Everything except --path is common to all workloads. Each
-        # workload entry may carry its own build_path (the real source
-        # dir, written into deploy/values.yaml by the rdx CLI); append
-        # --path per build below. Legacy single-workload mode uses the
-        # rdx_app() build_path argument.
-        pack_cmd_base = ' '.join(pack_args)
-        pack_cmd = pack_cmd_base + ' --path ' + build_path
-
-        if language == 'go' and os.path.exists('go.mod'):
-            local(
-                "set -e; " +
-                "if ! command -v go >/dev/null 2>&1; then " +
-                "echo '[rdx] go not on PATH; skipping go mod tidy preflight' >&2; " +
-                "exit 0; fi; " +
-                "if [ ! -f go.sum ] || [ go.mod -nt go.sum ]; then " +
-                "echo '[rdx] running go mod tidy (go.sum missing or stale)'; " +
-                "go mod tidy; " +
-                "fi",
-                quiet=False, echo_off=True,
-            )
-
-        live_update_steps = []
-        for path in sync_paths:
-            sync_target = '/workspace/' + path.lstrip('./')
-            live_update_steps.append(sync(path, sync_target))
-        install_cmd = defaults.get('live_update_install_cmd')
-        install_trigger = defaults.get('live_update_install_trigger', [])
-        if install_cmd and install_trigger:
-            live_update_steps.append(run(install_cmd, trigger=install_trigger))
-
-        deps = sync_paths if sync_paths else ['.']
-
-        # custom_build push semantics: on dev machines (Rancher Desktop,
-        # Mac Docker) the local Docker daemon and the cluster's container
-        # runtime share containerd, so a pack build that lands in the
-        # daemon is immediately visible to the cluster — no push needed.
-        # That's the default: skips_local_docker=True + disable_push=True
-        # ("the build command handled the push; Tilt, stay out of the way").
-        #
-        # In CI against a separate k8s (k3s with its own containerd, kind,
-        # k3d, …) the image must reach the cluster via a real registry.
-        # Pack doesn't publish without --publish, so Tilt has to push the
-        # daemon-resident image to default_registry itself. Flipping both
-        # flags to False lets Tilt do that: it inspects the local daemon
-        # for the pack-tagged image and `docker push`-es it to the
-        # registry configured by default_registry().
-        #
-        # Opt-in via env var so dev behaviour stays unchanged.
-        _local_push = os.getenv('RDX_TILT_PUSH_TO_REGISTRY') == '1'
-        _skips_local_docker = not _local_push
-        _disable_push = not _local_push
-
-        if _workloads:
-            # Workloads[] mode: build each workload whose image.tag == 'dev'.
-            # Workloads pointing to a real registry image (tag != 'dev') are
-            # pre-built and don't need a local pack build.
-            for _wl in _workloads:
-                _wl_image = _wl.get('image', {}) or {}
-                if _wl_image.get('tag') != 'dev':
-                    continue
-                _wl_repo = _wl_image.get('repository', name)
-                # The rdx CLI writes the real source dir per workload into
-                # values.yaml; fall back to the rdx_app() build_path arg.
-                _build_path = _wl.get('build_path', build_path)
-                _wl_pack_cmd = pack_cmd_base + ' --path ' + _build_path
-                custom_build(
-                    ref=_wl_repo,
-                    command=_wl_pack_cmd,
-                    deps=deps,
-                    ignore=[chart_path, 'deploy', '.rdx', 'Tiltfile'],
-                    # Match the image only where it appears as a container
-                    # `image:` ref. match_in_env_vars would ALSO match the
-                    # bare ref against env-var VALUES, and a short repository
-                    # like 'app' collides with everyday env values (a DB
-                    # username, a service name). That makes Tilt attach this
-                    # pack build to an unrelated backing pod whose env merely
-                    # carries the string — e.g. postgresql's
-                    # _POSTGRES_INITIAL_USERNAME=app — and try to build it.
-                    match_in_env_vars=False,
-                    skips_local_docker=_skips_local_docker,
-                    disable_push=_disable_push,
-                    live_update=live_update_steps if live_update_steps else None,
-                )
-        else:
-            # Legacy single-workload mode.
-            custom_build(
-                ref=name,
-                command=pack_cmd,
-                deps=deps,
-                ignore=[chart_path, 'deploy', '.rdx', 'Tiltfile'],
-                # See the workloads[] branch above: env-var matching on a
-                # short image ref attaches the build to unrelated pods.
-                match_in_env_vars=False,
-                skips_local_docker=_skips_local_docker,
-                disable_push=_disable_push,
-                live_update=live_update_steps if live_update_steps else None,
-            )
-
-    # Helm install. Renders the chart at chart_path with the given values
-    # files, applies the resulting manifests to the cluster.
-    #
-    # Run `helm dependency update` recursively. The parent chart vendors
-    # the RDX library chart at charts/rdx-library/, and the library chart
-    # itself declares oci:// dependencies on SUSE charts (e.g. postgresql).
-    # `helm dep update` is non-recursive — it only pulls deps for the path
-    # you pass. We walk charts/*/Chart.yaml first, update each, then update
-    # the parent. Without this step the SUSE sub-charts never land in
-    # charts/rdx-library/charts/ and their resources never get rendered.
-    # Requires `helm registry login dp.apps.rancher.io` (one-time, typically
-    # wired by the SUSE Rancher Desktop extension).
-    # Strategy: only run helm dep update INSIDE vendored sub-chart directories.
-    # We skip 'helm dep update' on the parent because:
-    #   1. The bundle vendors sub-charts as directories under charts/*. helm
-    #      template reads them directly — no parent update needed.
-    #   2. Running it on the parent repackages directories into .tgz files
-    #      and deletes any unmatched charts/, which interferes with the
-    #      recursive dep-update step.
-    # If the user introduces a non-vendored top-level dep later, they should
-    # vendor it (rdx convention) or run helm dep update themselves.
-    # The chart-version aligning helper lives in _align_subchart_versions.py
-    # next to this Tiltfile. read_file() resolves relative to the calling
-    # file, so it picks up the extension's copy even when loaded via ext://.
-    align_script_src = str(read_file('_align_subchart_versions.py'))
-    # Content-addressed /tmp path so the shell can invoke it via python3.
-    # Always overwrite to avoid stale-file attacks on predictable paths.
-    align_script_path = ('/tmp/_rdx_align_subchart_versions.' +
-                         str(hash(align_script_src) & 0x7fffffff) + '.py')
-    local('cat > ' + align_script_path + " <<'__RDX_PY_EOF__'\n" + align_script_src + "\n__RDX_PY_EOF__", echo_off=True, quiet=True)
-
-    # The dep-filter helper lives in _filter_enabled_deps.py next to this
-    # Tiltfile. See _align_subchart_versions.py comment for the read_file
-    # rationale.
-    filter_script_src = str(read_file('_filter_enabled_deps.py'))
-    # Content-addressed /tmp path; always overwrite (see align note).
-    filter_script_path = ('/tmp/_rdx_filter_enabled_deps.' +
-                          str(hash(filter_script_src) & 0x7fffffff) + '.py')
-    local('cat > ' + filter_script_path + " <<'__RDX_PY_EOF__'\n" + filter_script_src + "\n__RDX_PY_EOF__", echo_off=True, quiet=True)
-
-    # The helm-repo bootstrap helper lives in _bootstrap_helm_repos.py next
-    # to this Tiltfile. See _align_subchart_versions.py comment for the
-    # read_file rationale.
-    bootstrap_repos_script_src = str(read_file('_bootstrap_helm_repos.py'))
-    # Content-addressed /tmp path; always overwrite (see align note).
-    bootstrap_repos_script_path = ('/tmp/_rdx_bootstrap_helm_repos.' +
-                                   str(hash(bootstrap_repos_script_src) & 0x7fffffff) + '.py')
-    local('cat > ' + bootstrap_repos_script_path + " <<'__RDX_PY_EOF__'\n" + bootstrap_repos_script_src + "\n__RDX_PY_EOF__", echo_off=True, quiet=True)
-
-    # Speed: skip helm dep update when the cache is fresh.
-    #   - --skip-refresh: don't update the 15+ helm repos (metallb, harbor,
-    #     longhorn, rancher, ...). Wasted work because our deps use oci://
-    #     URLs that bypass helm's repo cache entirely.
-    #   - "Chart.lock newer than Chart.yaml + charts/*.tgz exists" guard:
-    #     skip the dep update + alignment loop entirely. Saves ~5-15s per
-    #     Tiltfile reload — these reloads happen on every save in the chart
-    #     tree, so the win compounds. helm dep build would be even faster
-    #     but requires a lock; we keep `update --skip-refresh` for the
-    #     first-run / after-upgrade case where the lock isn't present yet.
-    # Two passes (issue #7 H2). On cold start each sub-chart used to run
-    # its `helm dependency update --skip-refresh` (the OCI pulls that
-    # dominate cold wall-clock) one after another. Those pulls are
-    # independent per sub-chart, so we parallelize them — but keep the
-    # repo-registration step serial because `bootstrap_helm_repos.py`
-    # mutates global helm state (`helm repo add` writes
-    # ~/.config/helm/repositories.yaml) and racing it across sub-charts
-    # could corrupt that file.
-    #
-    #   Pass 1 (serial): filter deps + register repos + fast-path align.
-    #     Collects the sub-charts that still need an OCI pull into $_need.
-    #   Pass 2 (parallel, bounded fan-out): `helm dependency update` +
-    #     align per sub-chart. Each runs in its own subshell writing only
-    #     into that sub-chart's charts/, so they don't contend. A failure
-    #     marker turns any sub-chart's failure into a loud overall failure
-    #     (set -e can't see into backgrounded subshells).
-    helm_dep_script = (
-        'set -e; ' +
-        'if [ -d "' + chart_path + '/charts" ]; then ' +
-        '  _need=$(mktemp); ' +
-        '  for sub in "' + chart_path + '"/charts/*/; do ' +
-        '    [ -d "$sub" ] || continue; ' +
-        '    [ -f "$sub/Chart.yaml" ] || continue; ' +
-        '    grep -q "^dependencies:" "$sub/Chart.yaml" || continue; ' +
-        # Filter the library's deps down to only what's enabled in the
-        # project's values. Cuts SUSE OCI pulls from N (every catalog
-        # chart) to k (only the ones services[] turned on) per scenario.
-        # Reads the project's values.yaml + rdx render's overlay so the
-        # filter sees both static + DSL-derived enabled flags. Idempotent:
-        # backs up to Chart.yaml.full on first run, re-derives every run
-        # so disable→enable cycles work.
-        # No `|| true` here: a missing PyYAML / parse error / write error
-        # in the filter would leave Chart.yaml un-filtered and helm
-        # would pull every catalog entry, including HTTP-source repos
-        # the user hasn't registered. Better to fail loud with the
-        # filter's own remediation message than to mask it as a
-        # downstream `helm-manager-<sha>` cache miss two layers later.
-        '    python3 "' + filter_script_path + '" "$sub" ' +
-        '      "' + chart_path + '/values.yaml" ' +
-        '      "' + chart_path + '/.rdx/values.generated.yaml" || ' +
-        '      { echo "[rdx] FATAL: filter_enabled_deps.py failed for $sub"; exit 1; }; ' +
-        # Pre-flight: register any non-OCI helm repo referenced by the
-        # library Chart.yaml.full, so the subsequent
-        # `helm dep update --skip-refresh` can find their indexes.
-        # Idempotent + cheap. PyYAML required (already enforced above).
-        # Stays serial: helm repo add mutates global helm config.
-        '    python3 "' + bootstrap_repos_script_path + '" "$sub" || ' +
-        '      { echo "[rdx] FATAL: bootstrap_helm_repos.py failed for $sub"; exit 1; }; ' +
-        # Fast-path: lock fresh AND charts/ populated -> skip update.
-        '    if [ -f "$sub/Chart.lock" ] && [ "$sub/Chart.lock" -nt "$sub/Chart.yaml" ] && ' +
-        '       [ -d "$sub/charts" ] && [ -n "$(ls -A "$sub/charts" 2>/dev/null)" ]; then ' +
-        # Fast-path is the steady-state case (hit on every warm reload).
-        # Stay silent here (issue #7 L1) so a normal reload prints nothing;
-        # only genuine dep-update work in the parallel pass below echoes.
-        '      python3 "' + align_script_path + '" "$sub"; ' +
-        '    else ' +
-        '      printf "%s\\n" "$sub" >> "$_need"; ' +
-        '    fi; ' +
-        '  done; ' +
-        # Pass 2: parallel OCI pulls, bounded to 4 concurrent.
-        '  _fail=$(mktemp); rm -f "$_fail"; _n=0; ' +
-        '  while IFS= read -r sub; do ' +
-        '    [ -n "$sub" ] || continue; ' +
-        '    ( echo "[rdx] helm dep update --skip-refresh $sub"; ' +
-        # SUSE packaging quirk: their Helm charts publish OCI artifact
-        # tags like "0.4.4-29.1" but Chart.yaml inside says version
-        # "0.4.4". Helm matches deps against the INTERNAL version, so
-        # when the library declares postgresql at "0.4.4-29.1" the alias
-        # silently fails to resolve at template time and parent values
-        # never reach the sub-chart (no app user, no auth db). Patch
-        # each pulled sub-chart to align its internal version with what
-        # the parent expects. Drop when SUSE aligns version<->tag.
-        '      helm dependency update --skip-refresh "$sub" && ' +
-        '      python3 "' + align_script_path + '" "$sub" || ' +
-        '      { echo "[rdx] FATAL: helm dep update/align failed for $sub" >&2; : > "$_fail"; } ' +
-        '    ) & ' +
-        '    _n=$((_n+1)); ' +
-        '    if [ "$_n" -ge 4 ]; then wait; _n=0; fi; ' +
-        '  done < "$_need"; ' +
-        '  wait; ' +
-        '  rm -f "$_need"; ' +
-        '  if [ -f "$_fail" ]; then rm -f "$_fail"; ' +
-        '    echo "[rdx] FATAL: one or more sub-chart dep updates failed" >&2; exit 1; fi; ' +
-        '  rm -f "$_fail"; ' +
-        'fi'
-    )
-    local(helm_dep_script, echo_off=True, quiet=False)
-
-    # Note: values.yaml is NOT explicitly watched here. Tilt already
-    # watches the chart tree (via helm()), so dev edits to values.yaml
-    # trigger a reload naturally. An explicit watch_file would cause an
-    # infinite loop when reconcileHints or rdx render writes back to
-    # values.yaml during the reload.
-
-    # Ignore helm-managed paths so Tilt doesn't reload-loop. helm dep update
-    # writes .tgz files into charts/<sub>/charts/, plus tmpcharts-* dirs and
-    # Chart.lock. Tilt watches the project tree by default; without these
-    # ignores every helm dep update triggers a reload that re-runs helm dep
-    # update -> infinite loop.
-    # watch_settings(ignore=...) is GLOBAL — files matched are removed
-    # from ALL watch trees including live_update sync. So we keep this
-    # list narrow: only the helm-managed dynamic paths that would
-    # otherwise cause infinite Tiltfile reload loops on helm dep update
-    # output. We do NOT include src/ here even though src/ changes do
-    # trigger a Tiltfile reload (because helm() watches chart_path
-    # recursively) — ignoring src/ would also stop live_update from
-    # syncing src/ into the running container.
-    #
-    # The Tiltfile reload cost on src/ saves is acceptable because:
-    #   - the local() helm dep update / alignment cache via Helm's own
-    #     state and complete in <1s when nothing changed
-    #   - live_update's sync runs in parallel and the runtime watcher
-    #     (nodemon -L for nodejs) still picks up the change
-    # If users find the reload too noisy, the longer-term fix is to
-    # split the chart into a sub-directory so helm() doesn't watch the
-    # app source — out of scope for v0.7.
-    watch_settings(ignore=[
-        chart_path + '/charts/*/charts',
-        chart_path + '/charts/*/tmpcharts-*',
-        chart_path + '/charts/*/Chart.lock',
-        chart_path + '/Chart.lock',
-    ])
-
-    # Default values file follows chart_path. Bundle v0.8+ ships values.yaml
-    # under chart/, so when chart_path='chart' the defaults are 'chart/values.yaml'.
-    # Users overriding chart_values_files pass paths relative to the Tiltfile.
+    # Phase 6: DSL projection (rdx render).
     if chart_values_files == None:
         chart_values_files = [chart_path + '/values.yaml']
+    chart_values_files = _run_dsl_projection(
+        chart_path, _rdx_present, _stage, chart_values_files)
 
-    # ─── DSL projection (rdx render) ────────────────────────────────────
-    # Helm resolves sub-chart values BEFORE templates run, so the library
-    # chart's _helpers.tpl can't inject services[].auth.user.name into
-    # postgresql.auth.username at template time. The projection has to
-    # happen out of band — `rdx render` does it pre-helm. We call it here,
-    # right before `helm(...)`, so chart/values.generated.yaml is fresh
-    # for every tilt up. Spec: idefxH/rdx-cli/rdx.md BEHAVIOR: render.
-    # Closes idefxH/rdx-opinion-bundle-example#66.
-    #
-    # Wiring choices:
-    #   - We call `rdx render` (NOT --check) at every tilt up. Generating
-    #     is fast (millisecond-class for typical projects); --check would
-    #     just defer the same work to a second invocation if it found
-    #     drift. CI is the right place for --check.
-    #   - The generated overlay is APPENDED to chart_values_files so helm
-    #     reads the user's values + the projection. Order matters: user
-    #     values first (they're the truth), generated overlay second
-    #     (Helm's value-merge convention is later-wins, which is what we
-    #     want — the projected values_mapping output overrides any stale
-    #     manual entries the user may have left from before they adopted
-    #     `rdx render`).
-    #   - Missing rdx binary: graceful warning, no fail. Inner-loop dev
-    #     against an unreleased rdx branch shouldn't be blocked. The
-    #     downstream helm template will fail loud anyway via
-    #     validateConsistency if the user hasn't manually maintained the
-    #     equivalent values.
-    # Reuse the rdx-presence probe taken once at the top of rdx_app().
-    if _rdx_present:
-        # Run from chart_path's parent: `rdx render` resolves the project
-        # via cwd, and the project's chart_dir is computed relative to
-        # the .rdx/project.yaml location.
-        # Watch .rdx/stage at project root (parent of chart_path).
-        # No touch — the file must exist before tilt up. If absent,
-        # watch_file is a no-op (Tilt ignores missing paths).
-        stage_path_root = os.path.join(os.path.dirname(chart_path), '.rdx', 'stage')
-        watch_file(stage_path_root)
-        local('rdx render --stage %s' % _stage, quiet=True, echo_off=False)
-        # Look for the overlay at the new path first (rdx-cli v0.1.38+:
-        # chart/.rdx/values.generated.yaml), then fall back to the old
-        # path (chart/values.generated.yaml) for projects that were
-        # rendered with an older CLI. Both are valid; whichever exists
-        # is what `helm` should consume. The fallback gets the dev a
-        # working tilt up while they upgrade.
-        new_overlay = chart_path + '/.rdx/values.generated.yaml'
-        old_overlay = chart_path + '/values.generated.yaml'
-        if os.path.exists(new_overlay):
-            generated_overlay = new_overlay
-        elif os.path.exists(old_overlay):
-            generated_overlay = old_overlay
-            print('rdx: note — using legacy ' + old_overlay +
-                  '. rdx-cli v0.1.38+ writes to chart/.rdx/values.generated.yaml; ' +
-                  'next `rdx render` will migrate. You can delete the legacy ' +
-                  'file once chart/.rdx/values.generated.yaml exists.')
-        else:
-            generated_overlay = ''
-        # Only append when render actually produced the file (it does
-        # unconditionally — see render.go's writeAtomic — but stay
-        # defensive in case the user is on an older rdx binary that
-        # predates BEHAVIOR: render).
-        if generated_overlay != '':
-            # De-dup: if the user already passed the overlay in
-            # chart_values_files, don't add it twice (Helm tolerates
-            # dup files but the warning would confuse).
-            if generated_overlay not in chart_values_files:
-                chart_values_files = chart_values_files + [generated_overlay]
-    else:
-        print('rdx: warning — `rdx` not on PATH; chart/.rdx/values.generated.yaml ' +
-              'will not be regenerated. Install rdx CLI to keep services[] DSL ' +
-              'in sync with sub-chart values. See idefxH/rdx-cli.')
-
+    # Phase 7: Helm deploy.
     helm_set = []
     if image_ref:
-        helm_set.append('image.repository=' + _img_repo)
-        helm_set.append('image.tag=' + _img_tag)
+        helm_set.append('image.repository=' + _img_ctx['img_repo'])
+        helm_set.append('image.tag=' + _img_ctx['img_tag'])
 
-    # BCI builder live-update uid fix (see BCI_RUNAS_UID note up top).
-    # Run the app pod as the BCI builder's BUILD uid/gid so the launched
-    # container owns its /workspace source files and Tilt's live_update
-    # sync (which runs as the pod user) can overwrite them — otherwise the
-    # build-user-owned, launch-user-unwritable files block every reload.
-    # Scoped to the library subchart's podSecurityContext so only the app
-    # pod is touched; the heroku builder (single build/launch uid) and
-    # helm_only / image_ref deploys are left untouched.
     if _builder_kind == 'bci':
         _bci_uid = int(os.getenv('RDX_BCI_RUNAS_UID', str(BCI_RUNAS_UID)))
         _bci_gid = int(os.getenv('RDX_BCI_RUNAS_GID', str(BCI_RUNAS_GID)))
@@ -1716,13 +1810,6 @@ def rdx_app(
             helm_set.append('%s.podSecurityContext.runAsUser=%d' % (_lib_key, _bci_uid))
             helm_set.append('%s.podSecurityContext.runAsGroup=%d' % (_lib_key, _bci_gid))
 
-    # Check for ingress hostname conflicts with other namespaces.
-    # Two projects with the same ingress host (e.g. auth.localtest.me)
-    # cause Traefik to route to the wrong service silently.
-    # Gated to cold start (issue #7 M1): the underlying
-    # `kubectl get ingress --all-namespaces` is an O(cluster) scan, and a
-    # host collision can only appear when a project first comes up — it
-    # doesn't need re-checking on every src edit, only on the cold path.
     if not _bootstrap_done:
         _check_ingress_conflicts(chart_path, chart_values_files, namespace)
 
@@ -1734,56 +1821,15 @@ def rdx_app(
         set=helm_set,
     ))
 
-    # Surface the application Service on the requested port. Convention:
-    # local port == container port, so curl http://localhost:<port> works
-    # the same as in production behind an Ingress.
-    #
-    # Auto-discover ingress hosts from the project's values.yaml so the
-    # Tilt resource card shows clickable Ingress links alongside the
-    # port-forward. Reads `rdx-library.ingress` for the app, and each
-    # sub-chart's own ingress block for the services (grafana follows
-    # the standard `<chart>.ingress` shape; prometheus puts it under
-    # `<chart>.server.ingress`). User-defined values files override
-    # these via Tilt's standard --values stacking.
+    # Phase 8: Parse values for service discovery and port resolution.
     parsed_values = []
     parsed_values_paths = []
     for vfile in chart_values_files:
         parsed_values.append(read_yaml(vfile, default={}))
         parsed_values_paths.append(vfile)
 
-    # Match the embedded filter's _is_overlay_file. The rdx render
-    # overlay is appended LAST to chart_values_files (line ~1538), so a
-    # last-wins merge of services[] across parsed_values lets the
-    # overlay's projected entries overwrite the clean ones from
-    # values.yaml. The overlay's services[] can carry redacted-secret
-    # markers (when a values_mapping routes a field through a binding
-    # secret) and those markers must not reach the services-discovery
-    # loop. The chart-level overrides the overlay carries
-    # (`<chart>.enabled`, image tags, etc.) ARE still read — only the
-    # services[] block is skipped.
-    def _is_overlay_path(p):
-        if not p:
-            return False
-        return (p.endswith('/.rdx/values.generated.yaml') or
-                p.endswith('/values.generated.yaml') or
-                p == '.rdx/values.generated.yaml' or
-                p == 'values.generated.yaml')
-
-    # Derive `port` from chart/values.yaml when the caller didn't pass one.
-    # The library chart's deployment.yaml renders `containerPort: {{ .Values.port }}`
-    # and the Service maps Service.targetPort to the same value, so
-    # `rdx-library.port` is the canonical container port. Reading it
-    # here keeps the Tiltfile DRY: callers don't have to remember to set
-    # the same number in two places. Closes the same drift class as
-    # rdx-cli#65 (single source of truth).
-    #
-    # Resolution order (last wins, matches Helm's --values stacking):
-    #   1. library chart default (8080)
-    #   2. user's chart/values.yaml rdx-library.port
-    #   3. user-overridden values files
-    #   4. explicit port=NNN in rdx_app(...) — fails fast on mismatch
+    # Port discovery (legacy single-workload mode).
     if not _workloads:
-        # Legacy single-workload port discovery.
         discovered_port = 8080
         for cfg in parsed_values:
             lib = (cfg.get(_lib_key, {}) or {}) if cfg else {}
@@ -1800,681 +1846,34 @@ def rdx_app(
                 'need to override, change values.yaml.'
             ) % (port, _lib_key, discovered_port))
 
-    # Auto-discover services from `rdx-library.services[]` (the unified
-    # DSL in bundle v0.10+). Each entry has {binding, type, provisioning}
-    # and maps to (binding -> type) for the port-forward registration
-    # below.
-    #
-    # An explicit `services={...}` argument disables auto-discovery so a
-    # caller can register services the chart doesn't deploy itself, or
-    # narrow the surface to a subset.
-    #
-    # We dropped the pre-DSL legacy path (`rdx-library.<chart>.enabled`
-    # without `services[]`) when the bundle moved to DSL-only at v0.10.
-    # If you're on a bundle <= v0.9, pin the extension to its 0.1.x line
-    # or pass `services={...}` explicitly.
+    # Phase 9: Auto-discover services.
     if services == None:
-        services = {}
-        # Merged view across parsed_values:
-        #   - services[] entries come from chart/values.yaml (the user's
-        #     DSL) — overlay never has services[].
-        #   - chart-level <chart>.enabled comes from the overlay (written
-        #     by `rdx render` for every enabled local service) OR from
-        #     chart/values.yaml on pre-0.1.38 projects that wrote it
-        #     manually. Either source counts.
-        #
-        # Earlier impl looped per-cfg and looked up <chart>.enabled in
-        # the SAME cfg as the services[] entry. That broke for the
-        # canonical post-0.1.38 split: services[] is in values.yaml,
-        # <chart>.enabled is in the overlay, so the check failed for
-        # every service and Tilt never registered the workloads. Result:
-        # auto-Ingress link never showed up in the UI for grafana /
-        # prometheus / etc. Discovered live Apr 30 (issue #14, kind of).
-        #
-        # The fix: collect services[] and chart-level enabled separately
-        # across ALL cfgs, then intersect. Last-wins on binding-name
-        # de-dup matches Helm's --values stacking semantics.
-        all_lib_blocks = []
-        all_services_by_binding = {}
-        for i in range(len(parsed_values)):
-            cfg = parsed_values[i]
-            cfg_path = parsed_values_paths[i]
-            lib = (cfg.get(_lib_key, {}) or {}) if cfg else {}
-            # Always collect lib blocks — `_chart_enabled` below needs
-            # to see chart-level `<chart>.enabled` flags written into
-            # the overlay by `rdx render`.
-            all_lib_blocks.append(lib)
-            # Services[] DSL is sourced from values.yaml ONLY. The
-            # overlay re-projects it with values_mapping applied —
-            # which, when a mapping pulls a field through a binding
-            # secret, writes `[redacted secret …]` into the projected
-            # fields. With last-wins merge the overlay's redacted
-            # entries would clobber the clean values.yaml entries
-            # here. See `_is_overlay_path` above for the full why.
-            if _is_overlay_path(cfg_path):
-                continue
-            for entry in (lib.get('services') or []):
-                if entry.get('binding'):
-                    all_services_by_binding[entry['binding']] = entry
+        services = _discover_services(parsed_values, parsed_values_paths, _lib_key)
 
-        def _chart_enabled(stype, binding=''):
-            for lib in all_lib_blocks:
-                if (lib.get(stype, {}) or {}).get('enabled'):
-                    return True
-                # Multi-instance: check aliased block (<type>-<binding>).
-                if binding:
-                    alias = stype + '-' + binding
-                    if (lib.get(alias, {}) or {}).get('enabled'):
-                        return True
-            return False
-
-        for binding in all_services_by_binding:
-            entry = all_services_by_binding[binding]
-            stype = entry.get('type')
-            provisioning = entry.get('provisioning', '')
-            # Only deploy-mode entries register a workload. `local` and
-            # `deploy` both deploy in-cluster (legacy + current naming;
-            # README documents `deploy`); absent defaults to deploy.
-            # `connect` (external instance via binding secret),
-            # `shared` and `external` deploy NOTHING — registering a
-            # phantom k8s_resource for them fails with "unknown
-            # resource", and worse, in connect mode the host template
-            # often points at the binding secret which rdx's renderer
-            # surfaces as `[redacted secret <binding>-binding:host]`,
-            # producing the exact symptom we're guarding against.
-            if provisioning not in ('', 'local', 'deploy'):
-                continue
-            # services[].enabled drives deployment (rdx-cli v0.1.38+,
-            # bundle v0.11.6+). Default true if absent (back-compat with
-            # pre-0.1.38 scaffolds; fresh scaffolds opt-in explicitly).
-            # When false, the entry is inert: no binding-secret rendered,
-            # no chart-level enable flipped by rdx render, no sub-chart
-            # deployed.
-            if entry.get('enabled', True) == False:
-                continue
-            # Redacted-type guard: services[].type should always be a
-            # plain DSL type name (e.g. 'grafana'). If it's an
-            # `[redacted secret …]` marker, a bundle bug or a chained
-            # value_mapping is routing the type through rdx's redactor.
-            # Using that string as a chart key produces resources like
-            # `<release>-[redacted secret <binding>-binding:type]` —
-            # bizarre, unmatchable by k8s_resource, and the Tiltfile
-            # aborts loading. Skip cleanly and tell the dev where to
-            # look; the underlying sub-chart still renders (or fails
-            # loudly at helm time, which is where a values-pipeline bug
-            # belongs anyway).
-            if type(stype) == "string" and "[redacted" in stype:
-                warn(("[rdx] skipping services[binding=%r]: type=%r " +
-                      "is a redacted secret marker. The DSL type should be " +
-                      "a plain string (e.g. 'grafana'). Check the bundle's " +
-                      "dsl-mappings.yaml for a values_mapping that routes " +
-                      "`services[].type` through a binding secret — that's " +
-                      "the layer to fix; the Tiltfile cannot recover a real " +
-                      "type from the redacted marker.") % (binding, stype))
-                continue
-            # Belt-and-braces: at least one cfg must have <chart>.enabled
-            # true, otherwise the sub-chart isn't deployed and we'd
-            # register a phantom k8s_resource.
-            if not _chart_enabled(stype, binding):
-                continue
-            if stype:
-                services[binding] = stype
-
-    # Resolve {{.domain}} from the project's rdx-library.domain value.
+    # Resolve domain for hairpin DNS and ingress links.
     _domain_value = ''
     for _cfg in parsed_values:
         _dl = (_cfg.get(_lib_key, {}) or {}) if _cfg else {}
         if 'domain' in _dl:
             _domain_value = _dl['domain']
 
-    # Hairpin DNS fix: when the workspace uses a loopback dev domain,
-    # override its in-cluster resolution so pods reaching peers by their
-    # public ingress hostname land on the Traefik ClusterIP instead of
-    # their own loopback. Tilt owns the ConfigMap's lifecycle (applied
-    # here, removed on `tilt down`). No-op for real domains.
     _apply_coredns_hairpin(_domain_value, name)
 
-    def _ingress_links(block, ingress_key='ingress', domain=''):
-        """Extract clickable ingress links from a values block."""
-        ing = block.get(ingress_key, {}) if block else {}
-        hosts = ing.get('hosts', [])
-        if not hosts:
-            if not ing.get('enabled'):
-                return []
-        scheme = 'https' if ing.get('tls') else 'http'
-        out = []
-        for h in hosts:
-            if type(h) == "string":
-                host = h
-            elif type(h) == "dict":
-                host = h.get('host', '')
-            else:
-                continue
-            if not host:
-                continue
-            # Resolve {{.domain}} placeholder using the project's domain
-            # setting so Tilt shows clickable links for templated hosts.
-            if "{{" in host or "}}" in host:
-                if domain:
-                    host = host.replace("{{.domain}}", domain).replace("{{ .domain }}", domain)
-                else:
-                    continue
-            if "{{" in host or "}}" in host:
-                continue
-            out.append(link(scheme + '://' + host, host))
-        return out
-
-    def _rdx_lib_block(values_dict, *path):
-        block = values_dict.get(_lib_key, {}) or {}
-        for key in path:
-            block = (block.get(key, {}) or {}) if hasattr(block, 'get') else {}
-        return block
-
-    # ─── Service resource-name resolution (shared) ──────────────────────
-    # The workload name is NOT always <release>-<chart-name> — some SUSE
-    # charts add a master/replica suffix (redis → <release>-redis-master,
-    # prometheus → <release>-prometheus-server, mariadb-galera variants
-    # → <release>-mariadb-primary, etc.). The authoritative source of the
-    # actual K8s resource name is the `service.host` template in the
-    # bundle's library-chart/dsl-mappings.yaml — the same template the
-    # library helper uses to build the binding-secret's `host` key.
-    # We read that file (vendored at chart_path/charts/rdx-library/
-    # dsl-mappings.yaml after `helm dep update`), pick the chart-type's
-    # entry, render the host template by substituting .Release.Name.
-    # Fallback when the file is absent (older bundle) or the type isn't
-    # catalogued: the legacy <release>-<service_type> assumption.
-    #
-    # Defined here (before the workload registration) so the app
-    # workloads can resolve a backing service's resource name to depend
-    # on it — see the OIDC/Dex ordering block below.
+    # Phase 10: Read DSL mappings for service resource-name resolution.
     mappings_path = chart_path + '/charts/' + _lib_key + '/dsl-mappings.yaml'
     mappings_doc = read_yaml(mappings_path, default={'charts': {}})
     catalogued_charts = mappings_doc.get('charts', {})
 
-    def workload_name_for(release, chart_alias, service_type):
-        """Compute the rendered K8s workload name for a chart alias.
+    # Phase 11: Register service workloads (also computes OIDC deps).
+    _app_oidc_deps = _register_service_workloads(
+        name, namespace, services, _lib_key, parsed_values,
+        parsed_values_paths, catalogued_charts, labels,
+        _domain_value, _bootstrap_done)
 
-        For single-instance types, chart_alias == service_type (backward compat).
-        For multi-instance types, chart_alias == <type>-<binding> and the
-        host template is adjusted accordingly.
-
-        For operator-managed types (e.g. cnpg), the `service.host` template
-        points at a Service that is created at RUNTIME by the operator
-        once the CR is reconciled (e.g. `<release>-cnpg-rw`). That name is
-        NOT in the helm-rendered manifest, so registering it with
-        k8s_resource() fails with "unknown resource". Instead, when the
-        mapping declares `operator_managed: true`, use `operator_resource`
-        — the chart-rendered operator/cluster handle that Tilt CAN see.
-        """
-        chart_entry = catalogued_charts.get(service_type, {})
-        versions = chart_entry.get('versions', [])
-        if not versions:
-            return release + '-' + chart_alias
-        ver = versions[0]
-        if ver.get('operator_managed', False):
-            op_tpl = ver.get('operator_resource', '')
-            if op_tpl:
-                if chart_alias != service_type:
-                    op_tpl = op_tpl.replace('-' + service_type, '-' + chart_alias, 1)
-                return op_tpl.replace('{{ .Release.Name }}', release).replace('{{.Release.Name}}', release)
-        host_tpl = ver.get('service', {}).get('host', '')
-        if not host_tpl:
-            return release + '-' + chart_alias
-        # For multi-instance, replace the type in the host template with the alias.
-        if chart_alias != service_type:
-            host_tpl = host_tpl.replace('-' + service_type + '.', '-' + chart_alias + '.', 1)
-        rendered = host_tpl.replace('{{ .Release.Name }}', release).replace('{{.Release.Name}}', release)
-        if '.' in rendered:
-            rendered = rendered.split('.', 1)[0]
-        return rendered
-
-    def _bad_workload_name(s):
-        """True if a computed workload name is unsafe to pass to k8s_resource.
-
-        Catches three failure shapes we've actually hit:
-          - empty / whitespace
-          - unresolved Helm template tokens ("{{") — dsl-mappings entry
-            referenced a value the Tiltfile can't substitute (e.g.
-            `{{ .Values.<binding>.host }}`)
-          - rdx's redacted-secret marker ("[redacted secret ...]") —
-            seen when the host template points at a binding-secret key
-            in connect mode and the rendered manifest leaks the marker
-            into a resource name. Registering a k8s_resource for such a
-            name fails with `unknown resource` and aborts the Tiltfile.
-
-        Skipping registration is strictly safer than aborting: Tilt will
-        still auto-discover the actual workload by its real name from
-        the manifest stream, just without our port-forward/labels overlay.
-        """
-        if not s or not s.strip():
-            return True
-        if '{{' in s or '}}' in s:
-            return True
-        if '[redacted' in s or 'redacted secret' in s:
-            return True
-        return False
-
-    # Compute chart aliases for multi-instance support (#24).
-    # Same convention as the CLI: single-instance types keep the bare type,
-    # multi-instance types get <type>-<binding> for ALL instances.
-    type_counts = {}
-    for binding_name, service_type in services.items():
-        type_counts[service_type] = type_counts.get(service_type, 0) + 1
-
-    aliases = {}  # binding → chart_alias
-    for binding_name, service_type in services.items():
-        if type_counts[service_type] == 1:
-            aliases[binding_name] = service_type
-        else:
-            aliases[binding_name] = service_type + '-' + binding_name
-
-    # ─── App → OIDC/Dex startup ordering ────────────────────────────────
-    # When a project binds an OIDC provider (Dex), the app container
-    # eagerly connects to the issuer at boot to fetch its discovery
-    # document / validate client credentials (the binding's
-    # client_id/client_secret live in values.yaml). On a cold `tilt up`
-    # the app Deployment and the Dex sub-chart are applied in the same
-    # helm stream, so Tilt may start the app pod before Dex has any
-    # ready endpoint. The app's first OIDC call then fails and — unless
-    # the app retries — it stays unhealthy until a manual restart (the
-    # "I have to restart the app for it to connect to Dex" symptom).
-    #
-    # Make the app wait: collect the registered resource name of every
-    # OIDC-provider service and hang it off the app workloads' Tilt
-    # `resource_deps`, so Tilt brings Dex up green BEFORE it starts the
-    # app. Mirrors the service-loop registration (same workload_name_for
-    # + _bad_workload_name guard) so the dep name always matches a real
-    # resource; a name we'd skip registering is also skipped here, never
-    # producing a dangling resource_deps entry that aborts the Tiltfile.
-    _OIDC_PROVIDER_TYPES = ['dex']
-    _app_oidc_deps = []
-    for _oidc_binding, _oidc_type in services.items():
-        if _oidc_type not in _OIDC_PROVIDER_TYPES:
-            continue
-        _oidc_ce = catalogued_charts.get(_oidc_type, {})
-        _oidc_cvs = _oidc_ce.get('versions', [])
-        # Operator-managed providers register under their CR name, not the
-        # host-derived name; we don't model that ordering here.
-        if _oidc_cvs and _oidc_cvs[0].get('operator_managed', False):
-            continue
-        _oidc_wl = workload_name_for(name, aliases[_oidc_binding], _oidc_type)
-        if _bad_workload_name(_oidc_wl):
-            continue
-        if _oidc_wl not in _app_oidc_deps:
-            _app_oidc_deps.append(_oidc_wl)
-
-    if _workloads:
-        # ─── Workloads[] mode: per-workload k8s_resource ────────────────
-        # Re-read workloads from the fully-merged parsed_values so any
-        # overlay values are included (last-wins, matches Helm stacking).
-        _merged_workloads = []
-        for cfg in parsed_values:
-            lib = (cfg.get(_lib_key, {}) or {}) if cfg else {}
-            wls = lib.get('workloads')
-            if wls:
-                _merged_workloads = wls
-        if not _merged_workloads:
-            _merged_workloads = _workloads
-
-        # The library chart names each workload Deployment with the
-        # `rdx-library.name` helper, defined as `default .Release.Name
-        # .Values.name` — so when the project's values set `<lib>.name`,
-        # THAT (not the Helm release name) is the workload prefix. The
-        # release name (this function's `name` arg, passed to helm() as
-        # name=name) is NOT always that value: a project can deploy under
-        # a release that differs from its DSL name. Compute the SAME
-        # effective prefix the chart uses, last-wins across parsed_values
-        # to match Helm's --values stacking, so our `workload=` matches
-        # the rendered Deployment. Using `name` blindly registered
-        # `<release>-<wl>` against a manifest carrying `<lib-name>-<wl>`,
-        # which aborts the Tiltfile with `unknown resource`.
-        _chart_name = name
-        for cfg in parsed_values:
-            lib = (cfg.get(_lib_key, {}) or {}) if cfg else {}
-            if lib.get('name'):
-                _chart_name = lib['name']
-
-        for _wl in _merged_workloads:
-            _wl_name = _wl.get('name', 'app')
-            _wl_port = _wl.get('port')
-            # Asymmetric compose mapping (`8071:8000`): the import writes a
-            # localPort holding the host side so the forward becomes
-            # localhost:8071 → Service:8000. Default to the Service port
-            # when localPort is absent (symmetric `8080:8080`).
-            _local_port = _wl.get('localPort', _wl_port)
-            _wl_links = _ingress_links(_wl, domain=_domain_value)
-            _resource_name = _chart_name + '-' + _wl_name
-            if _wl_port:
-                # Forward local <localPort> to the Service port, which equals
-                # the workload's containerPort: service.yaml renders
-                # `port: {{ $wl.port }}` with `targetPort: http`, so the
-                # Service is reached on the same number the container
-                # listens on (no fixed :80 indirection). Forwarding to a
-                # hardcoded :80 would miss a Service exposing e.g. 8083.
-                # The local side matches the compose-published host port so
-                # the dev hits localhost:<localPort>.
-                k8s_resource(
-                    workload=_resource_name,
-                    port_forwards='%d:%d' % (_local_port, _wl_port),
-                    labels=[labels.get(_resource_name, 'app')],
-                    links=_wl_links,
-                    resource_deps=_app_oidc_deps,
-                    auto_init=True,
-                )
-            else:
-                k8s_resource(
-                    workload=_resource_name,
-                    labels=[labels.get(_resource_name, 'app')],
-                    links=_wl_links,
-                    resource_deps=_app_oidc_deps,
-                )
-    else:
-        # ─── Legacy single-workload mode ────────────────────────────────
-        app_links = []
-        for cfg in parsed_values:
-            app_links.extend(_ingress_links(cfg.get(_lib_key, {}) or {}, domain=_domain_value))
-
-        k8s_resource(
-            workload=name,
-            port_forwards='%d:%d' % (port, port),
-            labels=[labels.get(name, 'app')],
-            links=app_links,
-            resource_deps=_app_oidc_deps,
-        )
-
-    # Surface each declared service on its conventional port, using the
-    # shared service-name machinery (mappings_path / catalogued_charts /
-    # workload_name_for / aliases) defined above the workload block.
-
-    # Register CRD kinds for operator-managed charts so Tilt
-    # recognises them as claimable objects in k8s_resource(objects=...).
-    _registered_kinds = {}
-    for _stype in services.values():
-        _ce = catalogued_charts.get(_stype, {})
-        _cvs = _ce.get('versions', [])
-        if _cvs and _cvs[0].get('operator_managed'):
-            _cr_kind_info = _cvs[0].get('cr_kind', {})
-            if _cr_kind_info:
-                _kind_key = _cr_kind_info.get('kind', '')
-                _api_ver = _cr_kind_info.get('api_version', '')
-                if _kind_key and _kind_key not in _registered_kinds:
-                    k8s_kind(_kind_key, api_version=_api_ver, pod_readiness='wait')
-                    _registered_kinds[_kind_key] = True
-
-    # ─── Operator admission-webhook lifecycle hooks ─────────────────────
-    # Catalog-driven webhook lifecycle for any chart that bundles an
-    # operator with cluster-scoped Mutating/ValidatingWebhookConfiguration
-    # objects. Two failure modes the catalog metadata defends against:
-    #
-    # (B1) Stale-webhook prune — `tilt down` does NOT reliably remove
-    # cluster-scoped webhook configs whose names are helm-templated off
-    # the release. A leftover config from a prior scenario points its
-    # `clientConfig.service.namespace` at a now-deleted namespace; the
-    # apiserver then blocks every admission in the new scenario with
-    # `no endpoints available for service "<svc>"`. We prune any configs
-    # whose target namespace no longer exists BEFORE Tilt applies the new
-    # helm output. Label-scoped via `webhook_app_label` so we don't touch
-    # unrelated configs.
-    #
-    # (B2) Endpoint-ready gate — on a cold cluster the operator pod image
-    # pull can run >5s. The operator's CR is rendered in the same helm
-    # stream as the operator Deployment + webhook configs; the apiserver
-    # tries to validate the CR via the webhook the moment kubectl apply
-    # lands. With no operator pod yet, validation fails. We register a
-    # local_resource that waits for the operator's webhook Service to have
-    # at least one Endpoints address, and add it to the CR's resource_deps.
-    #
-    # An operator entry in dsl-mappings.yaml opts in by setting
-    # `operator_managed: true` AND declaring `webhook_service_name`.
-    # Optional: `webhook_namespace` (default: release namespace),
-    # `webhook_app_label` (selector value for the prune scan, default
-    # from _OPERATOR_DEFAULTS table below).
-    #
-    # _OPERATOR_DEFAULTS lets older bundles (whose catalog doesn't yet
-    # declare webhook_* fields) keep the same hook behavior. New operators
-    # should declare these in their dsl-mappings entry instead of adding
-    # to this table.
-    _OPERATOR_DEFAULTS = {
-        'cnpg': {
-            'webhook_service_name': 'cnpg-webhook-service',
-            'webhook_app_label': 'cloudnative-pg',
-        },
-    }
-    _op_hooks = []
-    _op_seen_types = {}
-    for _binding, _stype in services.items():
-        if _stype in _op_seen_types:
-            continue
-        _ce = catalogued_charts.get(_stype, {})
-        _cvs = _ce.get('versions', [])
-        if not _cvs:
-            continue
-        _ver = _cvs[0]
-        if not _ver.get('operator_managed'):
-            continue
-        _defaults = _OPERATOR_DEFAULTS.get(_stype, {})
-        _wh_svc = _ver.get('webhook_service_name',
-                           _defaults.get('webhook_service_name', ''))
-        if not _wh_svc:
-            continue
-        _op_seen_types[_stype] = True
-        _wh_ns = _ver.get('webhook_namespace', '') or namespace
-        _wh_label = _ver.get('webhook_app_label',
-                             _defaults.get('webhook_app_label', ''))
-        _op_res = ''
-        _op_tpl = _ver.get('operator_resource', '')
-        if _op_tpl:
-            _op_res = (_op_tpl
-                .replace('{{ .Release.Name }}', name)
-                .replace('{{.Release.Name}}', name))
-        _op_hooks.append({
-            'service_type': _stype,
-            'webhook_service_name': _wh_svc,
-            'webhook_namespace': _wh_ns,
-            'webhook_app_label': _wh_label,
-            'operator_resource': _op_res,
-            'ready_resource': name + '-' + _stype + '-webhook-ready',
-        })
-
-    # service_type → ready_resource name. Consumed in the CR-registration
-    # loop below to attach the gate to the CR's resource_deps.
-    _op_ready_by_type = {}
-    for _h in _op_hooks:
-        _op_ready_by_type[_h['service_type']] = _h['ready_resource']
-
-    for _hook in _op_hooks:
-        # (B1) Prune orphaned webhook configs scoped by app label.
-        # Skip when no label is configured: a label-less kubectl get
-        # would return EVERY cluster-scoped webhook config — far too
-        # broad to safely mass-prune.
-        # Gated to cold start (issue #7 M4): this is a stale-cluster
-        # safety net, not something that needs re-running on every save.
-        # _bootstrap_done means this session already brought the namespace
-        # up once, so any stale webhook configs were already pruned.
-        if _hook['webhook_app_label'] and not _bootstrap_done:
-            _sel = 'app.kubernetes.io/name=' + _hook['webhook_app_label']
-            local(
-                "set -e; " +
-                "for wc in " +
-                "$(kubectl get mutatingwebhookconfigurations.admissionregistration.k8s.io " +
-                "-l " + _sel + " -o name 2>/dev/null) " +
-                "$(kubectl get validatingwebhookconfigurations.admissionregistration.k8s.io " +
-                "-l " + _sel + " -o name 2>/dev/null); do " +
-                "ns=$(kubectl get \"$wc\" -o " +
-                "jsonpath='{.webhooks[0].clientConfig.service.namespace}' 2>/dev/null); " +
-                "if [ -n \"$ns\" ] && ! kubectl get namespace \"$ns\" " +
-                ">/dev/null 2>&1; then " +
-                "kubectl delete \"$wc\" --ignore-not-found >/dev/null && " +
-                "echo \"[rdx] pruned stale " + _hook['service_type'] +
-                " webhook $wc (target ns $ns missing)\"; " +
-                "fi; " +
-                "done",
-                quiet=False, echo_off=True)
-
-        # (B2) Endpoint-ready gate. Polls every 2s for up to 180s.
-        # `resource_deps` on the operator Deployment makes Tilt run this
-        # only after the operator pod is past Pending. The CR's
-        # k8s_resource (below) deps on this resource, which gates the
-        # kubectl apply of the CR.
-        _wait_deps = []
-        if _hook['operator_resource']:
-            _wait_deps = [_hook['operator_resource']]
-        local_resource(
-            _hook['ready_resource'],
-            cmd=(
-                "set -e; " +
-                "for i in $(seq 1 90); do " +
-                "ips=$(kubectl get endpoints " + _hook['webhook_service_name'] + " " +
-                "-n " + _hook['webhook_namespace'] + " " +
-                "-o jsonpath='{.subsets[*].addresses[*].ip}' " +
-                "2>/dev/null || true); " +
-                "if [ -n \"$ips\" ]; then " +
-                "echo \"[rdx] " + _hook['webhook_service_name'] +
-                " endpoints ready in " + _hook['webhook_namespace'] + ": $ips\"; " +
-                "exit 0; " +
-                "fi; " +
-                "sleep 2; " +
-                "done; " +
-                "echo \"[rdx] FATAL: " + _hook['webhook_service_name'] +
-                " has no endpoints after 180s in ns " + _hook['webhook_namespace'] + "\" >&2; " +
-                "exit 1"
-            ),
-            resource_deps=_wait_deps,
-            labels=[_hook['service_type']],
-            allow_parallel=True,
-        )
-
-    used_local_ports = {}
-    for binding_name, service_type in services.items():
-        chart_alias = aliases[binding_name]
-        workload = workload_name_for(name, chart_alias, service_type)
-        if _bad_workload_name(workload):
-            warn(('[rdx] skipping k8s_resource for binding %r ' +
-                  '(type=%r): computed workload name %r is not a valid ' +
-                  'k8s resource name. This usually means dsl-mappings.yaml ' +
-                  'has a host/cr_object template that references a value ' +
-                  'the Tiltfile cannot resolve (e.g. a binding-secret key ' +
-                  'in `provisioning: connect` mode). Set provisioning ' +
-                  'explicitly if you meant to deploy in-cluster, or ignore ' +
-                  'this warning if Tilt auto-discovers the workload.') %
-                 (binding_name, service_type, workload))
-            continue
-
-        # Sub-chart ingress lookup. Use chart_alias for values lookup
-        # (multi-instance values are keyed by alias, not bare type).
-        svc_port = 0
-        chart_entry = catalogued_charts.get(service_type, {})
-        chart_versions = chart_entry.get('versions', [])
-
-        # Derive ingress_path from values_mapping['ingress.enabled'].
-        # e.g. 'minio.consoleIngress.enabled' -> ['consoleIngress']
-        #      'prometheus.server.ingress.enabled' -> ['server', 'ingress']
-        #      'grafana.ingress.enabled' -> ['ingress']
-        # Segments: drop first (chart name) and last ('enabled') to get path within chart block.
-        _ingress_vm = (chart_versions[0].get('values_mapping', {}) or {}).get('ingress.enabled', '') if chart_versions else ''
-        if _ingress_vm:
-            _segs = _ingress_vm.split('.')
-            ingress_path = _segs[1:-1] if len(_segs) > 2 else ['ingress']
-        else:
-            ingress_path = ['ingress']
-        svc_links = []
-        for cfg in parsed_values:
-            parent = _rdx_lib_block(cfg, chart_alias, *ingress_path[:-1])
-            svc_links.extend(_ingress_links(parent, ingress_path[-1], domain=_domain_value))
-        is_operator_managed = False
-        pod_selector = {}
-        cr_object = ''
-        operator_resource = ''
-        if chart_versions:
-            svc_spec = chart_versions[0].get('service', {})
-            svc_port = svc_spec.get('port', 0)
-            is_operator_managed = chart_versions[0].get('operator_managed', False)
-            raw_selector = chart_versions[0].get('pod_selector', {})
-            for sel_k, sel_v in raw_selector.items():
-                pod_selector[sel_k] = sel_v.replace('{{ .Release.Name }}', name).replace('{{.Release.Name}}', name)
-            raw_cr = chart_versions[0].get('cr_object', '')
-            if raw_cr:
-                cr_object = raw_cr.replace('{{ .Release.Name }}', name).replace('{{.Release.Name}}', name)
-            raw_op = chart_versions[0].get('operator_resource', '')
-            if raw_op:
-                operator_resource = raw_op.replace('{{ .Release.Name }}', name).replace('{{.Release.Name}}', name)
-            # Multi-port: find the primary port
-            if not svc_port and svc_spec.get('ports'):
-                for pname, pspec in svc_spec['ports'].items():
-                    if pspec.get('primary', False):
-                        svc_port = pspec.get('port', 0)
-                        break
-                # No primary? Take the first one.
-                if not svc_port:
-                    for pname, pspec in svc_spec['ports'].items():
-                        svc_port = pspec.get('port', 0)
-                        break
-
-        if is_operator_managed and cr_object:
-            # Operator-managed charts (e.g. CNPG): k8s_kind() registered
-            # the CRD kind above, so Tilt auto-discovers the CR as a
-            # workload. Keep its discovered name (cr_name) — do NOT
-            # rename to the DSL workload name, because that name is
-            # already taken by the operator's auto-discovered Deployment
-            # (e.g. app-cloudnative-pg). Attach operator-created pods
-            # via label selectors.
-            cr_name = cr_object.split(':')[0]
-            if _bad_workload_name(cr_name):
-                warn(('[rdx] skipping k8s_resource for operator CR ' +
-                      'of binding %r (type=%r): computed cr_name %r is ' +
-                      'not a valid k8s resource name. The CRD entry in ' +
-                      'dsl-mappings.yaml has a `cr_object` template the ' +
-                      'Tiltfile cannot resolve.') %
-                     (binding_name, service_type, cr_name))
-                continue
-            resource_kwargs = {
-                'workload': cr_name,
-                'labels': [labels.get(workload, 'services')],
-                'links': svc_links,
-            }
-            if pod_selector:
-                resource_kwargs['extra_pod_selectors'] = [pod_selector]
-            _cr_deps = []
-            if operator_resource:
-                _cr_deps.append(operator_resource)
-            # Operator-managed services that ship admission webhooks
-            # (catalog opts in via `webhook_service_name`): wait for the
-            # operator's webhook Service to have endpoints before applying
-            # the CR. See the (B2) gate registered above.
-            _wh_ready = _op_ready_by_type.get(service_type, '')
-            if _wh_ready:
-                _cr_deps.append(_wh_ready)
-            if _cr_deps:
-                resource_kwargs['resource_deps'] = _cr_deps
-            if svc_port:
-                local_port = svc_port
-                if local_port < 1024:
-                    local_port = svc_port + 10000
-                while local_port in used_local_ports:
-                    local_port += 1
-                used_local_ports[local_port] = True
-                resource_kwargs['port_forwards'] = '%d:%d' % (local_port, svc_port)
-            k8s_resource(**resource_kwargs)
-        elif svc_port:
-            local_port = svc_port
-            if local_port < 1024:
-                local_port = svc_port + 10000
-            while local_port in used_local_ports:
-                local_port += 1
-            used_local_ports[local_port] = True
-            k8s_resource(
-                workload=workload,
-                port_forwards='%d:%d' % (local_port, svc_port),
-                labels=[labels.get(workload, 'services')],
-                links=svc_links,
-            )
-        else:
-            k8s_resource(
-                workload=workload,
-                labels=[labels.get(workload, 'services')],
-                links=svc_links,
-            )
-
+    # Phase 12: Register app workloads.
+    _register_app_workloads(
+        name, _workloads, _lib_key, parsed_values, labels,
+        _domain_value, _app_oidc_deps, port)
 
 # ─── helm_rdx_chart() — helm-rdx plugin integration (rdx-cli v0.2.0+) ──
 #
