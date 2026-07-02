@@ -1032,20 +1032,23 @@ def _update_helm_deps(chart_path):
         # charts/ dir and its Chart.lock is newer than Chart.yaml.
         _all_fresh = True
         _charts_dir = chart_path + '/charts'
-        if os.path.isdir(_charts_dir):
-            for _sub in os.listdir(_charts_dir):
-                _sub_path = _charts_dir + '/' + _sub
-                if not os.path.isdir(_sub_path):
-                    continue
+        if os.path.exists(_charts_dir):
+            for _sub in listdir(_charts_dir):
+                _sub_path = _sub  # listdir() returns full paths
                 _sub_chart = _sub_path + '/Chart.yaml'
                 if not os.path.exists(_sub_chart):
                     continue
                 _sub_lock = _sub_path + '/Chart.lock'
                 _sub_charts = _sub_path + '/charts'
-                if not os.path.exists(_sub_lock) or not os.path.isdir(_sub_charts):
+                if not os.path.exists(_sub_lock) or not os.path.exists(_sub_charts):
                     _all_fresh = False
                     break
-                if os.path.getmtime(_sub_chart) > os.path.getmtime(_sub_lock):
+                # Check if Chart.yaml is newer than Chart.lock (mtime compare)
+                _nt = str(local(
+                    'test "%s" -nt "%s" && echo yes || echo no' % (_sub_chart, _sub_lock),
+                    quiet=True, echo_off=True,
+                )).strip()
+                if _nt == 'yes':
                     _all_fresh = False
                     break
         if _all_fresh:
