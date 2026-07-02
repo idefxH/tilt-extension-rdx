@@ -409,6 +409,18 @@ if _rdx_default_registry:
 if os.getenv('RDX_ENABLE_TILT_SCRUB', '') != '1':
     secret_settings(disable_scrub=True)
 
+# ─── Pre-read Python helper scripts at module load time ───
+#
+# read_file() with a relative path resolves against the Tiltfile that
+# is currently being *evaluated*. At module top level (here) that is the
+# extension's own Tiltfile, so the paths resolve to rdx/*.py correctly.
+# Inside a function called from a *project* Tiltfile, the resolution
+# base shifts to the project directory and the scripts are not found.
+# Reading them once here avoids that problem entirely.
+_ALIGN_SCRIPT_SRC = str(read_file('_align_subchart_versions.py'))
+_FILTER_SCRIPT_SRC = str(read_file('_filter_enabled_deps.py'))
+_BOOTSTRAP_REPOS_SCRIPT_SRC = str(read_file('_bootstrap_helm_repos.py'))
+
 def _detect_lib_key(chart_path):
     """Return the top-level values key the project nests its DSL under.
 
@@ -1045,15 +1057,15 @@ def _update_helm_deps(chart_path):
             ])
             return
 
-    align_script_src = str(read_file('_align_subchart_versions.py'))
+    align_script_src = _ALIGN_SCRIPT_SRC
     align_script_path = ('/tmp/_rdx_align_subchart_versions.' +
                          str(hash(align_script_src) & 0x7fffffff) + '.py')
 
-    filter_script_src = str(read_file('_filter_enabled_deps.py'))
+    filter_script_src = _FILTER_SCRIPT_SRC
     filter_script_path = ('/tmp/_rdx_filter_enabled_deps.' +
                           str(hash(filter_script_src) & 0x7fffffff) + '.py')
 
-    bootstrap_repos_script_src = str(read_file('_bootstrap_helm_repos.py'))
+    bootstrap_repos_script_src = _BOOTSTRAP_REPOS_SCRIPT_SRC
     bootstrap_repos_script_path = ('/tmp/_rdx_bootstrap_helm_repos.' +
                                    str(hash(bootstrap_repos_script_src) & 0x7fffffff) + '.py')
 
