@@ -1003,21 +1003,67 @@ def _update_helm_deps(chart_path):
 
     Handles dep filtering, repo bootstrapping, version alignment, and
     parallel OCI pulls. Also sets watch_settings to avoid reload loops.
+
+    Short-circuits when the CLI's deps-vendored.lock sentinel is fresh:
+    `rdx workspace render` already runs helm dep update and writes the
+    sentinel, so re-running it here on cold start would duplicate 30-60s
+    of OCI pulls per project.
     """
+    # Fast path: if the CLI already vendored deps at import/render time,
+    # the chart tree hasn't changed since. Skip the entire dep-update
+    # pipeline. The sentinel is a SHA of Chart.yaml + Chart.lock + charts/
+    # mtimes written by vendorChartDepsForRender in the Go CLI.
+    _lock = chart_path + '/.rdx/deps-vendored.lock'
+    if os.path.exists(_lock):
+        # Validate the sentinel is still in sync with the chart tree by
+        # checking that every sub-chart with dependencies has a non-empty
+        # charts/ dir and its Chart.lock is newer than Chart.yaml.
+        _all_fresh = True
+        _charts_dir = chart_path + '/charts'
+        if os.path.isdir(_charts_dir):
+            for _sub in os.listdir(_charts_dir):
+                _sub_path = _charts_dir + '/' + _sub
+                if not os.path.isdir(_sub_path):
+                    continue
+                _sub_chart = _sub_path + '/Chart.yaml'
+                if not os.path.exists(_sub_chart):
+                    continue
+                _sub_lock = _sub_path + '/Chart.lock'
+                _sub_charts = _sub_path + '/charts'
+                if not os.path.exists(_sub_lock) or not os.path.isdir(_sub_charts):
+                    _all_fresh = False
+                    break
+                if os.path.getmtime(_sub_chart) > os.path.getmtime(_sub_lock):
+                    _all_fresh = False
+                    break
+        if _all_fresh:
+            watch_settings(ignore=[
+                chart_path + '/charts/*/charts',
+                chart_path + '/charts/*/tmpcharts-*',
+                chart_path + '/charts/*/Chart.lock',
+                chart_path + '/Chart.lock',
+            ])
+            return
+
     align_script_src = str(read_file('_align_subchart_versions.py'))
     align_script_path = ('/tmp/_rdx_align_subchart_versions.' +
                          str(hash(align_script_src) & 0x7fffffff) + '.py')
-    local('cat > ' + align_script_path + " <<'__RDX_PY_EOF__'\n" + align_script_src + "\n__RDX_PY_EOF__", echo_off=True, quiet=True)
 
     filter_script_src = str(read_file('_filter_enabled_deps.py'))
     filter_script_path = ('/tmp/_rdx_filter_enabled_deps.' +
                           str(hash(filter_script_src) & 0x7fffffff) + '.py')
-    local('cat > ' + filter_script_path + " <<'__RDX_PY_EOF__'\n" + filter_script_src + "\n__RDX_PY_EOF__", echo_off=True, quiet=True)
 
     bootstrap_repos_script_src = str(read_file('_bootstrap_helm_repos.py'))
     bootstrap_repos_script_path = ('/tmp/_rdx_bootstrap_helm_repos.' +
                                    str(hash(bootstrap_repos_script_src) & 0x7fffffff) + '.py')
-    local('cat > ' + bootstrap_repos_script_path + " <<'__RDX_PY_EOF__'\n" + bootstrap_repos_script_src + "\n__RDX_PY_EOF__", echo_off=True, quiet=True)
+
+    # Batch all three script writes into a single local() call to avoid
+    # 3 sequential shell spawns (~1-2s total overhead on cold start).
+    local(
+        'cat > ' + align_script_path + " <<'__RDX_PY_EOF__'\n" + align_script_src + "\n__RDX_PY_EOF__\n" +
+        'cat > ' + filter_script_path + " <<'__RDX_PY_EOF__'\n" + filter_script_src + "\n__RDX_PY_EOF__\n" +
+        'cat > ' + bootstrap_repos_script_path + " <<'__RDX_PY_EOF__'\n" + bootstrap_repos_script_src + "\n__RDX_PY_EOF__",
+        echo_off=True, quiet=True)
 
     helm_dep_script = (
         'set -e; ' +
