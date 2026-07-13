@@ -480,6 +480,9 @@ def _detect_lib_key(chart_path):
 # CoreDNS imports) — note that with that fixed name a single Tilt
 # session owns the object; running two rdx workspaces with different
 # loopback domains at once would have them contend for it.
+# Within one session the fixed name also makes it a session-wide
+# singleton — see _session_once() below for how multi-project
+# workspaces register it exactly once.
 
 # Curated wildcard-loopback dev domains: every subdomain resolves to
 # 127.0.0.1 by design. Matched as the bare domain or any suffix. Extend
@@ -590,11 +593,63 @@ data:
 """ % (workspace, slug, domain, domain, ip)
 
 
+# ─── Session-wide singletons ───────────────────────────────────────────
+#
+# Some objects this extension registers are cluster-wide singletons
+# with a fixed name — the `coredns-custom` ConfigMap below is one.
+# rdx_app() runs once per project, and a multi-project workspace calls
+# it several times in the same Tiltfile execution, but k8s_yaml()
+# hard-fails on a second registration of the same object (Duplicate
+# YAML). Singletons must therefore be registered exactly once per
+# execution, by whichever rdx_app() call reaches them first.
+#
+# Cross-call state can't live in a module global: loaded modules are
+# frozen by Starlark ("cannot insert into frozen hash table"), so the
+# state lives in the process environment instead. The reset loop below
+# runs at module top level, which executes exactly once per Tiltfile
+# execution (load() results are cached within an execution, and every
+# execution — including reloads in a running `tilt up` — re-evaluates
+# the module). Each execution therefore starts with clean guards and
+# re-registers every singleton exactly once.
+
+_SESSION_ONCE_PREFIX = '_RDX_INTERNAL_ONCE_'
+_SESSION_ONCE_KEYS = [
+    'COREDNS_HAIRPIN',
+]
+for _once_key in _SESSION_ONCE_KEYS:
+    os.putenv(_SESSION_ONCE_PREFIX + _once_key, '')
+
+
+def _session_once(key, identity):
+    """Claim the session-wide singleton `key` for this call.
+
+    Returns '' when the caller wins the claim (first call this
+    execution: go ahead and register the object), or the identity
+    recorded by the winning call (skip the registration; compare
+    identities to detect conflicting intents worth a warn()).
+
+    `key` must be listed in _SESSION_ONCE_KEYS so its guard is reset
+    at module load; `identity` must be a non-empty string.
+    """
+    env_key = _SESSION_ONCE_PREFIX + key
+    prev = os.getenv(env_key, '')
+    if prev:
+        return prev
+    os.putenv(env_key, identity)
+    return ''
+
+
 def _apply_coredns_hairpin(domain, workspace):
     """Apply the CoreDNS hairpin ConfigMap for a loopback dev domain.
 
     No-op (with a one-line note) for non-loopback domains, and a warning
     — never a failure — when the ingress ClusterIP can't be found.
+
+    The ConfigMap has one fixed name (kube-system/coredns-custom), so a
+    multi-project workspace registers it exactly once per Tiltfile
+    session: the first rdx_app() call wins, later calls with the same
+    domain -> IP mapping are quiet no-ops, and a later call with a
+    different mapping warns that it can't be honoured.
     """
     if not domain:
         return
@@ -606,6 +661,17 @@ def _apply_coredns_hairpin(domain, workspace):
              'ClusterIP (looked for Traefik by label and kube-system/' +
              'traefik). In-cluster calls to *.' + domain + ' will keep ' +
              'hitting pod loopback. Skipping the coredns-custom override.')
+        return
+    _identity = '*.' + domain + ' -> ' + ip
+    _prev = _session_once('COREDNS_HAIRPIN', _identity)
+    if _prev:
+        if _prev != _identity:
+            warn('[rdx] hairpin DNS: coredns-custom (kube-system) is ' +
+                 'already registered this session for ' + _prev + '; ' +
+                 'ignoring the conflicting mapping ' + _identity +
+                 ' requested by ' + workspace + '. One Tilt session ' +
+                 'manages a single hairpin mapping — align `domain` ' +
+                 'across the workspace values.yaml files.')
         return
     print('[rdx] hairpin DNS: pointing *.' + domain + ' at ingress ' +
           'ClusterIP ' + ip + ' via coredns-custom (kube-system).')

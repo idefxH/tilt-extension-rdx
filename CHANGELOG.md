@@ -46,6 +46,26 @@
 
 ### Fixed
 
+- **Multi-project workspaces: the hairpin-DNS ConfigMap is registered once
+  per Tilt session, not once per project.** `rdx_app()` applied the
+  `kube-system/coredns-custom` ConfigMap on every call, and Tilt hard-fails
+  the second registration of the same object — so any workspace with two or
+  more projects (e.g. a compose import yielding `grist` + `minio-setup`)
+  died at load with `Error in k8s_yaml: Duplicate YAML: ConfigMap
+  coredns-custom`. The registration now goes through a session-once guard
+  (`_session_once`): the first `rdx_app()` call registers the ConfigMap,
+  later calls with the same `domain -> ingress IP` mapping are quiet
+  no-ops, and a conflicting mapping (two projects declaring different
+  loopback domains — can't be honoured, the object has one fixed name)
+  warns instead of failing the load. Guard state lives in the process
+  environment (loaded-module globals are frozen in Starlark) and is reset
+  at module load, so every Tiltfile execution — including reloads in a
+  running `tilt up` — re-registers the ConfigMap exactly once. Audited the
+  rest of `rdx_app()` for the same class: no other unconditional
+  fixed-name registrations (namespace/pull-secret bootstrap is already
+  idempotent via `kubectl apply` + sentinels; everything else is release-
+  or project-scoped).
+
 - **BCI builder: `live_reload=True` no longer hard-fails the build.** The
   first cut selected `--default-process reload`, but there is no `reload`
   process: with `BP_LIVE_RELOAD_ENABLED=true` the Paketo language buildpack

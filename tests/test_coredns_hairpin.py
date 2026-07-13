@@ -15,10 +15,17 @@ match and the ConfigMap rendering) and validates:
      verbatim (must NOT be interpolated by Starlark / our %-substitution).
   4. The embedded `.server` block scalar is a valid Corefile zone that
      carries the domain and the resolved ingress ClusterIP.
+  5. Session-once guard: the ConfigMap has one fixed name, so in a
+     multi-project workspace only the FIRST rdx_app() call registers it;
+     identical later mappings no-op quietly, conflicting ones warn, and
+     a new session (module reload) starts from a clean guard. Also pins
+     the Tiltfile wiring: the guard sits between the module-level reset
+     and the single k8s_yaml() registration site.
 
 Usage: python3 test_coredns_hairpin.py
        chmod +x && ./test_coredns_hairpin.py
 """
+import os
 import sys
 
 try:
@@ -76,6 +83,54 @@ data:
         }
     }
 """ % (workspace, slug, domain, domain, ip)
+
+
+_SESSION_ONCE_PREFIX = '_RDX_INTERNAL_ONCE_'
+
+
+class _FakeEnv(object):
+    """Stand-in for the Tilt process environment (os.getenv/os.putenv).
+
+    Loaded-module globals are frozen in Starlark, so the Tiltfile keeps
+    the guard state in the process env; the module-level reset clears it
+    once per Tiltfile execution. `reset()` mirrors that module-load line.
+    """
+
+    def __init__(self):
+        self.vals = {}
+
+    def getenv(self, key, default=''):
+        return self.vals.get(key, default)
+
+    def putenv(self, key, value):
+        self.vals[key] = value
+
+    def reset(self, key):
+        # Mirror of: os.putenv(_SESSION_ONCE_PREFIX + _once_key, '')
+        self.putenv(_SESSION_ONCE_PREFIX + key, '')
+
+
+def _session_once(env, key, identity):
+    """Mirror of the Tiltfile-embedded `_session_once` guard."""
+    env_key = _SESSION_ONCE_PREFIX + key
+    prev = env.getenv(env_key, '')
+    if prev:
+        return prev
+    env.putenv(env_key, identity)
+    return ''
+
+
+def _apply_hairpin_guarded(env, domain, ip, workspace, applied, warnings):
+    """Mirror of the guarded tail of `_apply_coredns_hairpin`."""
+    identity = '*.' + domain + ' -> ' + ip
+    prev = _session_once(env, 'COREDNS_HAIRPIN', identity)
+    if prev:
+        if prev != identity:
+            warnings.append(
+                'coredns-custom already registered for %s; '
+                'ignoring %s requested by %s' % (prev, identity, workspace))
+        return
+    applied.append(_coredns_hairpin_yaml(domain, ip, workspace))
 
 
 # ---------------------------------------------------------------------------
@@ -149,9 +204,95 @@ def test_slug_for_multilevel_domain():
     print("ok  test_slug_for_multilevel_domain")
 
 
+def test_session_once_multi_project():
+    """A multi-project workspace registers the ConfigMap exactly once."""
+    env = _FakeEnv()
+    env.reset('COREDNS_HAIRPIN')  # module-load reset
+    applied, warnings = [], []
+
+    # First project wins the claim and registers.
+    _apply_hairpin_guarded(env, 'localtest.me', '10.43.0.1', 'grist',
+                           applied, warnings)
+    _expect(len(applied) == 1, "first rdx_app call must register the CM")
+    _expect(len(warnings) == 0, "no warning on the winning call")
+
+    # Second project, identical mapping: quiet no-op — this is the exact
+    # shape that used to die with `Duplicate YAML: ConfigMap coredns-custom`.
+    _apply_hairpin_guarded(env, 'localtest.me', '10.43.0.1', 'minio-setup',
+                           applied, warnings)
+    _expect(len(applied) == 1, "identical mapping must not re-register")
+    _expect(len(warnings) == 0, "identical mapping must not warn")
+
+    # Third project, conflicting mapping (different domain or ingress IP —
+    # shouldn't happen inside one cluster, but must be visible, not fatal).
+    _apply_hairpin_guarded(env, 'lvh.me', '10.43.0.1', 'other',
+                           applied, warnings)
+    _expect(len(applied) == 1, "conflicting mapping must not re-register")
+    _expect(len(warnings) == 1, "conflicting mapping must warn")
+    _expect('*.localtest.me -> 10.43.0.1' in warnings[0] and
+            '*.lvh.me -> 10.43.0.1' in warnings[0],
+            "warning must name both the registered and the ignored " +
+            "mapping; got: " + warnings[0])
+
+    # Winner's manifest is the one registered.
+    doc = yaml.safe_load(applied[0])
+    _expect('localtest-me.server' in doc['data'],
+            "the first project's domain must be the registered zone")
+    print("ok  test_session_once_multi_project")
+
+
+def test_session_once_resets_per_session():
+    """The module-load reset re-arms the guard on every Tiltfile
+    execution, so reloads in a running `tilt up` re-register the CM
+    (instead of dropping it because a stale env value survived in the
+    Tilt process)."""
+    env = _FakeEnv()
+    env.reset('COREDNS_HAIRPIN')
+    applied, warnings = [], []
+    _apply_hairpin_guarded(env, 'localtest.me', '10.43.0.1', 'ws',
+                           applied, warnings)
+    _expect(len(applied) == 1, "session 1 registers")
+
+    # New Tiltfile execution: module top level runs again in the same
+    # process — the reset must clear the previous session's claim.
+    env.reset('COREDNS_HAIRPIN')
+    _apply_hairpin_guarded(env, 'localtest.me', '10.43.0.1', 'ws',
+                           applied, warnings)
+    _expect(len(applied) == 2, "session 2 must register again after reset")
+    _expect(len(warnings) == 0, "no warnings across sessions")
+    print("ok  test_session_once_resets_per_session")
+
+
+def test_tiltfile_guard_wiring():
+    """Pin the Tiltfile wiring of the guard (the parts a pure-python
+    mirror can't execute): module-level reset, guard checked inside
+    _apply_coredns_hairpin BEFORE the single k8s_yaml registration."""
+    tiltfile = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            '..', 'rdx', 'Tiltfile')
+    with open(tiltfile) as f:
+        src = f.read()
+
+    _expect("os.putenv(_SESSION_ONCE_PREFIX + _once_key, '')" in src,
+            "module-level guard reset must exist (once per execution)")
+    _expect(src.count('k8s_yaml(blob(_coredns_hairpin_yaml(') == 1,
+            "exactly one registration site for the hairpin ConfigMap")
+
+    body = src.split('def _apply_coredns_hairpin(', 1)[1]
+    body = body.split('\ndef ', 1)[0]
+    _expect("_session_once('COREDNS_HAIRPIN'" in body,
+            "_apply_coredns_hairpin must claim the session guard")
+    _expect(body.index("_session_once('COREDNS_HAIRPIN'") <
+            body.index('k8s_yaml(blob(_coredns_hairpin_yaml('),
+            "guard must be checked before k8s_yaml registers the CM")
+    print("ok  test_tiltfile_guard_wiring")
+
+
 if __name__ == '__main__':
     test_loopback_detection()
     test_configmap_shape()
     test_go_template_literal_preserved()
     test_slug_for_multilevel_domain()
+    test_session_once_multi_project()
+    test_session_once_resets_per_session()
+    test_tiltfile_guard_wiring()
     print("\nAll CoreDNS hairpin tests passed.")
