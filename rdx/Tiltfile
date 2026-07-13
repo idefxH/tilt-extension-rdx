@@ -1937,8 +1937,14 @@ def rdx_app(
             helm_set.append('%s.podSecurityContext.runAsUser=%d' % (_lib_key, _bci_uid))
             helm_set.append('%s.podSecurityContext.runAsGroup=%d' % (_lib_key, _bci_gid))
 
-    if not _bootstrap_done:
-        _check_ingress_conflicts(chart_path, chart_values_files, namespace)
+    # Every execution, not just first-run bootstrap: a conflicting
+    # ingress (same hostname claimed by another namespace — typically a
+    # workspace left running under an older namespace) makes Traefik
+    # route that host to the wrong backend, and the resulting 502/wrong
+    # -service symptoms surface on RE-runs just as much as on first
+    # runs. One `kubectl get ingress -A` per project is cheap; the
+    # warning must not disappear after bootstrap.
+    _check_ingress_conflicts(chart_path, chart_values_files, namespace)
 
     k8s_yaml(helm(
         chart_path,
