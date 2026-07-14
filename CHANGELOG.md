@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## [0.7.0] - 2026-07-14
+
+_Rolls up everything since v0.6.2. Highlights: session-once guards fix
+the multi-project hairpin ConfigMap crash; a kube preflight turns
+dead-cluster tracebacks into one actionable failure; the
+ingress-conflict warning runs every execution; BCI Paketo build knobs
+land as rdx_app() arguments._
 
 ### Added
 
