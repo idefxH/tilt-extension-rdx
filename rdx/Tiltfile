@@ -1754,6 +1754,80 @@ def _register_service_workloads(
 # rdx_app() — orchestrator
 # ═══════════════════════════════════════════════════════════════════════
 
+def _register_declared_build(name, parsed_values, _lib_key, language,
+                             image_ref, helm_only):
+    """Register the build declared by workloads_resolved[].build.
+
+    P1 of the values.generated.yaml contract (DO-0015/DO-0016): the CLI
+    computes and validates the block at render time; this consumer only
+    wires it into Tilt. The build ref is the workload's DEPLOYED image
+    reference (values image.repository[:tag]) — Tilt substitution links
+    build to Deployment by that ref, so the block works on image_ref
+    projects without touching chart values. No key → no-op (pull, and
+    pre-contract CLIs keep today's behaviour).
+    """
+    block = None
+    image = {}
+    for _cfg in parsed_values:
+        _lib = (_cfg.get(_lib_key, {}) or {}) if _cfg else {}
+        for _wl in (_lib.get('workloads_resolved') or []):
+            if _wl.get('build'):
+                block = _wl['build']
+                image = _wl.get('image') or image
+            elif _wl.get('image'):
+                image = _wl.get('image')
+            break  # v1: app workload = first entry
+    if not block:
+        return
+    # Legacy precedence: an explicit language arg means the pack path
+    # already registered this project's build in the image phase.
+    if language and not helm_only and not image_ref:
+        warn(('[rdx] %s: build block present in values but rdx_app() ' +
+              'passes language=%r — the legacy pack path stays in ' +
+              'charge. Drop the language argument to let the block ' +
+              'drive the build.') % (name, language))
+        return
+    repo = str(image.get('repository') or '')
+    if not repo and image_ref:
+        repo = image_ref.rsplit(':', 1)[0]
+    if not repo:
+        warn('[rdx] %s: build block present but no workload image ' +
+             'reference to bind it to; skipping.' % name)
+        return
+    strategy = block.get('strategy', '')
+    context = block.get('context', '')
+    _lu = []
+    for _w in (block.get('watch') or []):
+        _s = (_w or {}).get('sync') or {}
+        if _s.get('local') and _s.get('container'):
+            _lu.append(sync(os.path.join(context, _s['local']),
+                            _s['container']))
+    if strategy == 'dockerfile':
+        docker_build(repo, context,
+                     dockerfile=os.path.join(context,
+                                             block.get('dockerfile',
+                                                       'Dockerfile')),
+                     live_update=_lu)
+        print('[rdx] %s: building %s from %s (dockerfile, declared)' %
+              (name, repo, context))
+    elif strategy == 'buildpack':
+        _bb = block.get('builder', '') or _RDX_DEFAULT_BUILDER or 'heroku'
+        _builder_img = ('ghcr.io/idefxh/builder-bci-base'
+                        if _bb == 'bci' else 'heroku/builder:24')
+        custom_build(
+            repo,
+            'pack build $EXPECTED_REF --builder ' + _builder_img +
+            ' --path ' + context,
+            deps=[context],
+            skips_local_docker=False,
+        )
+        print('[rdx] %s: building %s from %s (buildpack %s, declared)' %
+              (name, repo, context, _bb))
+    else:
+        warn('[rdx] %s: unknown declared build strategy %r; skipping.'
+             % (name, strategy))
+
+
 def rdx_app(
         name,
         language=None,
@@ -2056,6 +2130,15 @@ def rdx_app(
     _register_app_workloads(
         name, _workloads, _lib_key, parsed_values, labels,
         _domain_value, _app_oidc_deps, port)
+
+    # Phase 13: Declarative build block (DO-0016 P1). Consume
+    # workloads_resolved[].build from the freshly projected overlay
+    # (contract_version >= 1) and register the matching image build.
+    # Legacy explicit build args win: a pack build already registered
+    # by the language path keeps priority, with a deprecation warning
+    # when a block is also present. Absent key = pull, unchanged.
+    _register_declared_build(name, parsed_values, _lib_key, language,
+                             image_ref, helm_only)
 
 # ─── helm_rdx_chart() — helm-rdx plugin integration (rdx-cli v0.2.0+) ──
 #
