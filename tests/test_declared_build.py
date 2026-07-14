@@ -19,7 +19,8 @@ def test_declared_build_wiring():
             "consumer must read the projected contract key")
     _expect('docker_build(' in body and 'custom_build(' in body,
             "both strategies must register a Tilt image build")
-    _expect('live_update=_lu' in body, "watch must map to live_update")
+    _expect("'live_update': _lu" in body or 'live_update=_lu' in body,
+            "watch must map to live_update")
     _expect(body.index('if not block:') < body.index('docker_build('),
             "absent key must be a no-op before any registration")
     _expect('language' in body.split('docker_build(')[0],

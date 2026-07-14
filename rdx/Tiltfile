@@ -1782,10 +1782,18 @@ def _register_declared_build(name, parsed_values, _lib_key, language,
     # Legacy precedence: an explicit language arg means the pack path
     # already registered this project's build in the image phase.
     if language and not helm_only and not image_ref:
-        warn(('[rdx] %s: build block present in values but rdx_app() ' +
-              'passes language=%r — the legacy pack path stays in ' +
-              'charge. Drop the language argument to let the block ' +
-              'drive the build.') % (name, language))
+        # Migration window: fresh imports write a buildpack block AND
+        # keep language= on rdx_app(). When the two agree the legacy
+        # pack path simply keeps driving — same builder chain, same
+        # semantics — so stay silent; warn only on a real disagreement
+        # (e.g. the dev switched the block to dockerfile but the
+        # scaffolded language= is still in place).
+        if block.get('strategy', '') != 'buildpack':
+            warn(('[rdx] %s: values declare a %s build but rdx_app() ' +
+                  'passes language=%r — the legacy pack path stays in ' +
+                  'charge. Drop the language argument to let the ' +
+                  'block drive the build.')
+                 % (name, block.get('strategy', ''), language))
         return
     repo = str(image.get('repository') or '')
     if not repo and image_ref:
@@ -1803,11 +1811,16 @@ def _register_declared_build(name, parsed_values, _lib_key, language,
             _lu.append(sync(os.path.join(context, _s['local']),
                             _s['container']))
     if strategy == 'dockerfile':
+        _kw = {'live_update': _lu}
+        if block.get('target'):
+            _kw['target'] = block['target']
+        if block.get('args'):
+            _kw['build_args'] = block['args']
         docker_build(repo, context,
                      dockerfile=os.path.join(context,
                                              block.get('dockerfile',
                                                        'Dockerfile')),
-                     live_update=_lu)
+                     **_kw)
         print('[rdx] %s: building %s from %s (dockerfile, declared)' %
               (name, repo, context))
     elif strategy == 'buildpack':
