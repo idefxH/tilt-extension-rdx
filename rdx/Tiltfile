@@ -103,6 +103,54 @@ BUILDER_IMAGES = {
 def _is_bci_builder_image(image):
     return image != None and 'builder-bci' in image
 
+# ─── Contract v1 resolved blocks (values.generated.yaml) ───
+#
+# The rdx CLI publishes the resolved language projection and the
+# effective builder in the project overlay (bundle SPEC "VALUES-
+# GENERATED CONTRACT v1": top-level language_resolved / builder_resolved
+# next to contract_version). This extension PREFERS those blocks;
+# LANGUAGE_DEFAULTS' core live-update fields and the explicit-arg →
+# values → config → heroku builder chain below stay strictly as
+# PRE-CONTRACT FALLBACKS — overlays written by older CLIs, projects
+# with no overlay yet, or a language_resolved whose name doesn't match
+# (stale overlay after a language switch).
+#
+# Freshness: in the image phase the overlay on disk is the previous
+# evaluation's (this eval's `rdx render` runs later, in the projection
+# phase). That's fine — language_resolved is static per language/CLI
+# version, and builder_resolved is self-healing: read_yaml() registers
+# the file with Tilt's watcher, so the projection phase rewriting it
+# re-triggers evaluation and the next pass reads the fresh copy. The
+# declared-build phase runs after projection and always sees the fresh
+# overlay.
+#
+# All three helpers are pure (dict in, value out) and mirrored 1:1 in
+# tests/test_contract_resolved.py — keep them in lockstep.
+
+def _contract_language_block(overlay, language):
+    if not overlay or overlay.get('contract_version', 0) < 1:
+        return None
+    lr = overlay.get('language_resolved') or {}
+    if lr.get('name') != language:
+        return None
+    return lr
+
+def _contract_builder_image(overlay):
+    if not overlay or overlay.get('contract_version', 0) < 1:
+        return ''
+    return (overlay.get('builder_resolved') or {}).get('image') or ''
+
+def _builder_kind_for_image(image):
+    # Contract images are full refs; normalize back to the kind that
+    # drives the bci/heroku code paths (cache format, buildpack
+    # injection, uid fix). Unknown refs stay verbatim — same behaviour
+    # as passing a raw image through the legacy chain.
+    if _is_bci_builder_image(image):
+        return 'bci'
+    if image == DEFAULT_BUILDER or (image or '').startswith('heroku/builder'):
+        return 'heroku'
+    return image
+
 # ─── Runtime default builder from ~/.config/rdx/config.yaml ───
 #
 # A user-level config knob (`default_builder:`) lets a developer pick the
@@ -909,18 +957,41 @@ def _resolve_image_strategy(
     else:
         defaults = LANGUAGE_DEFAULTS[language]
 
+        # Contract v1: prefer the overlay's resolved blocks. The
+        # ext-specific knobs (buildpacks, pack_default_process,
+        # pack_build_env, bci_reload) are NOT in the contract and keep
+        # coming from LANGUAGE_DEFAULTS either way.
+        _overlay = read_yaml(chart_path + '/.rdx/values.generated.yaml',
+                             default={}) or {}
+        _lang_resolved = _contract_language_block(_overlay, language)
+        _builder_contract = _contract_builder_image(_overlay)
+
+        # Builder precedence: explicit builder= argument, then the
+        # values' own build.builder (live — fresher than a stale
+        # overlay for the same tier), then the contract's resolved
+        # image, then the pre-contract runtime chain (config default →
+        # heroku) for overlays older than the contract.
         _builder_sel = builder
         if _builder_sel == None or _builder_sel == '':
             _values_build = (_early_values.get('build', {}) or {}).get('builder')
             if _values_build == None or _values_build == '':
                 _values_build = (_early_lib.get('build', {}) or {}).get('builder')
             _builder_sel = _values_build
+        _from_contract = False
+        if (_builder_sel == None or _builder_sel == '') and _builder_contract:
+            _builder_sel = _builder_contract
+            _from_contract = True
         if _builder_sel == None or _builder_sel == '':
             _builder_sel = _RDX_DEFAULT_BUILDER
         if _builder_sel == None or _builder_sel == '':
             _builder_sel = 'heroku'
 
-        if _builder_sel in BUILDER_IMAGES:
+        if _from_contract:
+            # Contract values are full image refs, already expanded
+            # from any shorthand by the CLI (pinned BCI ref included).
+            _builder_kind = _builder_kind_for_image(_builder_sel)
+            _resolved_builder = _builder_sel
+        elif _builder_sel in BUILDER_IMAGES:
             _builder_kind = _builder_sel
             _resolved_builder = BUILDER_IMAGES[_builder_sel]
         else:
@@ -975,7 +1046,15 @@ def _resolve_image_strategy(
                 "Set RDX_SKIP_GHCR_CHECK=1 to silence this check.' >&2",
                 quiet=False, echo_off=True)
 
-        sync_paths = live_update_paths if live_update_paths != None else defaults['live_update_paths']
+        # Explicit argument > contract language_resolved (authoritative
+        # for its four fields, empty meaning "no sync") > pre-contract
+        # LANGUAGE_DEFAULTS.
+        if live_update_paths != None:
+            sync_paths = live_update_paths
+        elif _lang_resolved != None:
+            sync_paths = _lang_resolved.get('live_update_paths') or []
+        else:
+            sync_paths = defaults['live_update_paths']
 
         cache_dir = '/tmp/rdx-pack-cache-' + name
         cache_vol = 'rdx-pack-cache-' + name
@@ -1077,8 +1156,12 @@ def _resolve_image_strategy(
         for path in sync_paths:
             sync_target = '/workspace/' + path.lstrip('./')
             live_update_steps.append(sync(path, sync_target))
-        install_cmd = defaults.get('live_update_install_cmd')
-        install_trigger = defaults.get('live_update_install_trigger', [])
+        if _lang_resolved != None:
+            install_cmd = _lang_resolved.get('install_cmd')
+            install_trigger = _lang_resolved.get('install_trigger') or []
+        else:
+            install_cmd = defaults.get('live_update_install_cmd')
+            install_trigger = defaults.get('live_update_install_trigger', [])
         if install_cmd and install_trigger:
             live_update_steps.append(run(install_cmd, trigger=install_trigger))
 
@@ -1824,9 +1907,21 @@ def _register_declared_build(name, parsed_values, _lib_key, language,
         print('[rdx] %s: building %s from %s (dockerfile, declared)' %
               (name, repo, context))
     elif strategy == 'buildpack':
-        _bb = block.get('builder', '') or _RDX_DEFAULT_BUILDER or 'heroku'
-        _builder_img = ('ghcr.io/idefxh/builder-bci-base'
-                        if _bb == 'bci' else 'heroku/builder:24')
+        # Contract v1: builder_resolved from the SAME overlay this block
+        # came from (fresh — the projection phase just wrote it) is the
+        # CLI-applied chain (block builder → config default_builder →
+        # heroku), shorthands already expanded to pinned refs. The chain
+        # below survives solely as the pre-contract fallback for
+        # overlays written by older CLIs.
+        _builder_img = ''
+        for _cfg in parsed_values:
+            _from_overlay = _contract_builder_image(_cfg)
+            if _from_overlay:
+                _builder_img = _from_overlay
+        if not _builder_img:
+            _bb = block.get('builder', '') or _RDX_DEFAULT_BUILDER or 'heroku'
+            _builder_img = ('ghcr.io/idefxh/builder-bci-base'
+                            if _bb == 'bci' else 'heroku/builder:24')
         custom_build(
             repo,
             'pack build $EXPECTED_REF --builder ' + _builder_img +
@@ -1835,7 +1930,7 @@ def _register_declared_build(name, parsed_values, _lib_key, language,
             skips_local_docker=False,
         )
         print('[rdx] %s: building %s from %s (buildpack %s, declared)' %
-              (name, repo, context, _bb))
+              (name, repo, context, _builder_kind_for_image(_builder_img)))
     else:
         warn('[rdx] %s: unknown declared build strategy %r; skipping.'
              % (name, strategy))

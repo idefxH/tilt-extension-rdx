@@ -34,11 +34,24 @@ def _is_bci_builder_image(image):
     return image != None and 'builder-bci' in image
 
 
-def resolve_builder(builder=None, values=None, lib_values=None,
-                    config_default='', builder_image=None):
-    """Mirror of the Tiltfile builder-resolution block.
+def _builder_kind_for_image(image):
+    """Mirror of the Tiltfile helper: contract image ref -> kind."""
+    if _is_bci_builder_image(image):
+        return 'bci'
+    if image == DEFAULT_BUILDER or (image or '').startswith('heroku/builder'):
+        return 'heroku'
+    return image
 
-    Returns (builder_kind, builder_image_resolved) — the same
+
+def resolve_builder(builder=None, values=None, lib_values=None,
+                    config_default='', builder_image=None,
+                    contract_image=''):
+    """Mirror of the Tiltfile builder-resolution block (contract-aware).
+
+    Precedence: explicit builder= arg > values build.builder (live) >
+    contract builder_resolved.image (full ref, CLI-expanded) >
+    config default_builder > 'heroku'. Returns
+    (builder_kind, builder_image_resolved) — the same
     (_builder_kind, builder) the Tiltfile computes.
     """
     values = values or {}
@@ -50,12 +63,19 @@ def resolve_builder(builder=None, values=None, lib_values=None,
         if _values_build == None or _values_build == '':
             _values_build = (lib_values.get('build', {}) or {}).get('builder')
         _builder_sel = _values_build
+    _from_contract = False
+    if (_builder_sel == None or _builder_sel == '') and contract_image:
+        _builder_sel = contract_image
+        _from_contract = True
     if _builder_sel == None or _builder_sel == '':
         _builder_sel = config_default
     if _builder_sel == None or _builder_sel == '':
         _builder_sel = 'heroku'
 
-    if _builder_sel in BUILDER_IMAGES:
+    if _from_contract:
+        _builder_kind = _builder_kind_for_image(_builder_sel)
+        _resolved_builder = _builder_sel
+    elif _builder_sel in BUILDER_IMAGES:
         _builder_kind = _builder_sel
         _resolved_builder = BUILDER_IMAGES[_builder_sel]
     else:
@@ -186,6 +206,38 @@ def test_non_bci_raw_image_stays_raw():
     _check(img == raw, img)
 
 
+def test_contract_beats_config_default():
+    # Contract v1: builder_resolved (already a full ref) outranks the
+    # runtime config default — the CLI folded the config in at render
+    # time; the live read only serves pre-contract overlays.
+    kind, img = resolve_builder(contract_image=BCI_BUILDER,
+                                config_default='heroku')
+    _check(kind == 'bci', 'contract image must win over config: ' + repr(kind))
+    _check(img == BCI_BUILDER, img)
+
+
+def test_contract_heroku_image_keeps_heroku_kind():
+    # The kind drives the cache-format branch (heroku = bind mounts);
+    # a contract full ref must normalize back, not become a raw kind.
+    kind, img = resolve_builder(contract_image=DEFAULT_BUILDER)
+    _check(kind == 'heroku', 'full heroku ref must keep kind heroku: '
+           + repr(kind))
+    _check(img == DEFAULT_BUILDER, img)
+
+
+def test_values_builder_beats_contract():
+    # values.yaml is live; a stale overlay's contract block must not
+    # override the same tier read fresh.
+    kind, _ = resolve_builder(values={'build': {'builder': 'heroku'}},
+                              contract_image=BCI_BUILDER)
+    _check(kind == 'heroku', 'live values must beat contract: ' + repr(kind))
+
+
+def test_explicit_arg_beats_contract():
+    kind, _ = resolve_builder(builder='heroku', contract_image=BCI_BUILDER)
+    _check(kind == 'heroku', 'explicit arg must beat contract: ' + repr(kind))
+
+
 if __name__ == '__main__':
     failures = 0
     for fn in (test_explicit_arg_wins_over_everything,
@@ -202,7 +254,11 @@ if __name__ == '__main__':
                test_raw_bci_image_future_tag_normalizes,
                test_bci_image_via_config_default_normalizes,
                test_builder_image_override_to_bci_normalizes_kind,
-               test_non_bci_raw_image_stays_raw):
+               test_non_bci_raw_image_stays_raw,
+               test_contract_beats_config_default,
+               test_contract_heroku_image_keeps_heroku_kind,
+               test_values_builder_beats_contract,
+               test_explicit_arg_beats_contract):
         try:
             fn()
             sys.stdout.write('PASS %s\n' % fn.__name__)
