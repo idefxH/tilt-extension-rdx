@@ -615,6 +615,7 @@ data:
 _SESSION_ONCE_PREFIX = '_RDX_INTERNAL_ONCE_'
 _SESSION_ONCE_KEYS = [
     'COREDNS_HAIRPIN',
+    'KUBE_PREFLIGHT',
 ]
 for _once_key in _SESSION_ONCE_KEYS:
     os.putenv(_SESSION_ONCE_PREFIX + _once_key, '')
@@ -637,6 +638,48 @@ def _session_once(key, identity):
         return prev
     os.putenv(env_key, identity)
     return ''
+
+
+def _kube_preflight():
+    """Fail fast — with an actionable message — when the active kube
+    context can't serve requests at Tiltfile-load time.
+
+    rdx_app()'s bootstrap runs kubectl mutations while the Tiltfile is
+    being evaluated (namespace create, pull-secret mirror). With an
+    unreachable cluster — Rancher Desktop not started, a k3s that went
+    away, a kubeconfig pointing at a dead endpoint — those commands die
+    with raw kubectl noise (connection refused, `failed to download
+    openapi`, even an interactive auth prompt) plus a traceback into
+    this extension, which reads like an rdx bug instead of what it is:
+    no cluster. Probe once per Tiltfile execution (session-wide
+    singleton) and turn that noise into one clear failure naming the
+    context and server.
+
+    `kubectl version` costs one authenticated round-trip and no OpenAPI
+    download; stdin comes from /dev/null so no kubeconfig can prompt
+    and hang the load; --request-timeout bounds the wait when the
+    endpoint blackholes instead of refusing.
+    """
+    if _session_once('KUBE_PREFLIGHT', 'ok'):
+        return
+    reachable = str(local(
+        'kubectl version --request-timeout=5s >/dev/null 2>&1 </dev/null ' +
+        '&& echo yes || echo no',
+        quiet=True, echo_off=True)).strip()
+    if reachable == 'yes':
+        return
+    server = str(local(
+        "kubectl config view --minify -o " +
+        "jsonpath='{.clusters[0].cluster.server}' 2>/dev/null " +
+        "</dev/null || true",
+        quiet=True, echo_off=True)).strip()
+    fail(('[rdx] cannot reach the Kubernetes cluster for kube context ' +
+          '%r (server: %s). rdx_app() creates the project namespace ' +
+          'and mirrors pull-secrets while the Tiltfile loads, so ' +
+          '`tilt up` needs a running, reachable cluster. Start your ' +
+          'cluster (Rancher Desktop, k3s, …) or switch to a live one ' +
+          '(`kubectl config use-context <ctx>`), then reload.')
+         % (k8s_context(), server or 'unknown'))
 
 
 def _apply_coredns_hairpin(domain, workspace):
@@ -715,6 +758,12 @@ def _bootstrap_namespace(name, chart_path, _lib_key):
     Returns a dict with keys: namespace, rdx_present, rdx_can_expand,
     bootstrap_done.
     """
+    # Everything below shells out to kubectl and mutates the cluster;
+    # verify the active context answers at all before the first call so
+    # a stopped cluster fails with one actionable message instead of a
+    # raw kubectl error mid-bootstrap.
+    _kube_preflight()
+
     _rdx_probe = str(local(
         'if command -v rdx > /dev/null 2>&1; then _p=yes; else _p=no; fi; ' +
         'if [ "$_p" = yes ] && rdx namespace --help > /dev/null 2>&1; ' +

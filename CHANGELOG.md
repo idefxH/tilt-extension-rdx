@@ -46,6 +46,28 @@
 
 ### Fixed
 
+- **Unreachable cluster now fails the Tiltfile load with one actionable
+  message instead of raw kubectl noise.** `rdx_app()`'s bootstrap runs
+  kubectl mutations at load time (namespace create, pull-secret mirror);
+  with a stopped cluster or a kubeconfig pointing at a dead endpoint the
+  load died mid-pipe on whatever kubectl hit first — `dial tcp
+  127.0.0.1:6443: connection refused`, `failed to download openapi`, or
+  even an interactive auth prompt — with a traceback into this extension
+  that read like an rdx bug. `_kube_preflight()` now probes the active
+  context once per Tiltfile execution (session-once guard;
+  `kubectl version --request-timeout=5s`, stdin detached so nothing can
+  prompt) before the first mutation, and on failure `fail()`s with the
+  kube context name, the server URL, and what to do: start the cluster
+  or `kubectl config use-context` a live one. Healthy clusters pay one
+  ~100ms round-trip per load; behaviour is otherwise unchanged.
+
+- **Ingress-conflict warning no longer disappears after first-run
+  bootstrap.** `_check_ingress_conflicts` (hostname already claimed by
+  another namespace — Traefik would route to the wrong backend) was
+  gated on the bootstrap sentinel, so re-runs stayed silent exactly when
+  a stale workspace in an old namespace was causing 502s. It now runs on
+  every execution (one `kubectl get ingress -A` per project).
+
 - **Multi-project workspaces: the hairpin-DNS ConfigMap is registered once
   per Tilt session, not once per project.** `rdx_app()` applied the
   `kube-system/coredns-custom` ConfigMap on every call, and Tilt hard-fails
