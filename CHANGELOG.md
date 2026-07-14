@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.8.0] - 2026-07-14
+
+_The extension becomes a consumer of the render contract: the declared
+`build:` block in values now drives image builds, with the legacy
+`language=` path kept quiet through the migration window._
+
+### Added
+
+- **Declared-build consumer (values.generated contract v1).** Phase 13
+  of `rdx_app()`: after projection, the extension reads the declared
+  build block from the freshly generated overlay
+  (`workloads_resolved[].build`, `contract_version: 1`) and registers
+  the matching image build — `docker_build()` for
+  `strategy=dockerfile` (block `watch` entries become `live_update`
+  syncs; `target` and `args` forwarded), pack `custom_build()` for
+  `strategy=buildpack` (builder from the block, else config default).
+  The ref is the workload's deployed image reference, so blocks work on
+  image_ref projects untouched. An absent key is a no-op: pre-contract
+  CLIs and blockless projects keep today's behaviour byte-for-byte.
+- **Migration-window ergonomics.** When values declare a buildpack
+  block AND `rdx_app()` still passes `language=` (what fresh imports
+  now scaffold), the legacy pack path keeps driving silently —
+  identical semantics, no per-reload noise. The deprecation warning
+  fires only on a real disagreement (e.g. the block switched to
+  dockerfile while `language=` remains).
+
 ## [0.7.0] - 2026-07-14
 
 _Rolls up everything since v0.6.2. Highlights: session-once guards fix
