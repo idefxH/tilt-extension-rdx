@@ -32,6 +32,21 @@ def _contract_builder_image(overlay):
     return (overlay.get('builder_resolved') or {}).get('image') or ''
 
 
+def _contract_pack_block(overlay, language, effective_builder_image):
+    if not overlay or overlay.get('contract_version', 0) < 1:
+        return None
+    pr = overlay.get('pack_resolved')
+    if not pr:
+        return None
+    lr = overlay.get('language_resolved') or {}
+    if lr.get('name') != language:
+        return None
+    br = (overlay.get('builder_resolved') or {}).get('image') or ''
+    if br != effective_builder_image:
+        return None
+    return pr
+
+
 _OVERLAY = {
     'contract_version': 1,
     'language_resolved': {
@@ -44,6 +59,13 @@ _OVERLAY = {
     'builder_resolved': {
         'image': 'ghcr.io/idefxh/builder-bci-base:16.0.2',
         'source': 'config_default',
+    },
+    'pack_resolved': {
+        'buildpacks': [],
+        'env': {'NODE_ENV': 'development', 'BP_NODE_RUN_SCRIPTS': ''},
+        'default_process': 'dev',
+        'cache_format': 'volume',
+        'preflights': [],
     },
     'rdx-library': {},
 }
@@ -81,11 +103,30 @@ def test_builder_image_gates():
     print('ok  test_builder_image_gates')
 
 
+def test_pack_block_gates():
+    # Matching (language, builder) pair: consumed.
+    pr = _contract_pack_block(_OVERLAY, 'nodejs',
+                              'ghcr.io/idefxh/builder-bci-base:16.0.2')
+    _expect(pr is not None and pr['cache_format'] == 'volume',
+            'matching pair must return the pack block')
+    # Coupling rule: a different effective builder (explicit override,
+    # fresher values) must fall back wholesale.
+    _expect(_contract_pack_block(_OVERLAY, 'nodejs', 'heroku/builder:24')
+            is None, 'builder mismatch must fall back')
+    # Language mismatch (stale overlay) must fall back.
+    _expect(_contract_pack_block(_OVERLAY, 'python',
+                                 'ghcr.io/idefxh/builder-bci-base:16.0.2')
+            is None, 'language mismatch must fall back')
+    _expect(_contract_pack_block({}, 'nodejs', 'x') is None,
+            'missing overlay must fall back')
+    print('ok  test_pack_block_gates')
+
+
 def test_mirrors_match_tiltfile_source():
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             '..', 'rdx', 'Tiltfile')).read()
     for fn_name in ('_contract_language_block', '_contract_builder_image',
-                    '_builder_kind_for_image'):
+                    '_contract_pack_block', '_builder_kind_for_image'):
         _expect('def %s(' % fn_name in src,
                 'Tiltfile lost helper %s' % fn_name)
     print('ok  test_mirrors_match_tiltfile_source')
@@ -99,6 +140,8 @@ def test_image_phase_consumes_contract_with_fallback():
             'image phase must read language_resolved')
     _expect('_contract_builder_image(' in body,
             'image phase must read builder_resolved')
+    _expect('_contract_pack_block(' in body,
+            'image phase must read pack_resolved')
     # Fallbacks stay wired (downgraded, not deleted).
     _expect("defaults['live_update_paths']" in body,
             'LANGUAGE_DEFAULTS sync paths must remain the fallback')
@@ -106,6 +149,22 @@ def test_image_phase_consumes_contract_with_fallback():
             'LANGUAGE_DEFAULTS install cmd must remain the fallback')
     _expect('_RDX_DEFAULT_BUILDER' in body,
             'runtime config chain must remain the fallback')
+    _expect("defaults['buildpacks'] + extra_buildpacks" in body,
+            'LANGUAGE_DEFAULTS buildpacks must remain the fallback')
+    _expect("defaults.get('pack_build_env')" in body,
+            'LANGUAGE_DEFAULTS pack env must remain the fallback')
+    _expect('BUILDER_BUILD_ENV.get(' in body,
+            'BUILDER_BUILD_ENV must remain the fallback env layer')
+    _expect("defaults.get('pack_default_process')" in body,
+            'LANGUAGE_DEFAULTS default process must remain the fallback')
+    _expect("language == 'go'" in body,
+            'go preflight language rule must remain the fallback')
+    _expect("'bind' if _builder_kind == 'heroku' else 'volume'" in body,
+            'kind cache rule must remain the fallback')
+    # Contract-first precedence for the pack pieces.
+    _expect(body.index('_contract_pack_block(') <
+            body.index("defaults['buildpacks']"),
+            'pack block must be consulted before the buildpack fallback')
     # Precedence: explicit argument still wins over the contract.
     _expect(body.index('live_update_paths != None') <
             body.index('_lang_resolved.get'),
@@ -133,6 +192,7 @@ def test_declared_build_consumes_contract_with_fallback():
 if __name__ == '__main__':
     test_language_block_gates()
     test_builder_image_gates()
+    test_pack_block_gates()
     test_mirrors_match_tiltfile_source()
     test_image_phase_consumes_contract_with_fallback()
     test_declared_build_consumes_contract_with_fallback()

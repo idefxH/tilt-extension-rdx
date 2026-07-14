@@ -1,0 +1,89 @@
+{
+  "bci_env": {
+    "nodejs": {
+      "BP_NODE_RUN_SCRIPTS": ""
+    }
+  },
+  "builder_pins": {
+    "bci": "ghcr.io/idefxh/builder-bci-base:16.0.2",
+    "heroku": "heroku/builder:24"
+  },
+  "cache_format": {
+    "bci": "volume",
+    "heroku_family": "bind",
+    "unknown": "volume"
+  },
+  "languages": {
+    "go": {
+      "live_update_paths": [],
+      "install_trigger": [],
+      "install_cmd": "",
+      "run_command": [],
+      "buildpacks": [
+        "heroku/go",
+        "heroku/procfile"
+      ],
+      "pack_env": {},
+      "default_process": "",
+      "preflights": [
+        "go-mod-tidy"
+      ]
+    },
+    "java": {
+      "live_update_paths": [],
+      "install_trigger": [],
+      "install_cmd": "",
+      "run_command": [],
+      "buildpacks": [
+        "heroku/java",
+        "heroku/procfile"
+      ],
+      "pack_env": {},
+      "default_process": "",
+      "preflights": []
+    },
+    "nodejs": {
+      "live_update_paths": [
+        "src"
+      ],
+      "install_trigger": [
+        "package.json",
+        "package-lock.json"
+      ],
+      "install_cmd": "cd /workspace \u0026\u0026 npm install --production=false",
+      "run_command": [
+        "/cnb/process/dev"
+      ],
+      "buildpacks": [
+        "heroku/nodejs",
+        "heroku/procfile"
+      ],
+      "pack_env": {
+        "NODE_ENV": "development"
+      },
+      "default_process": "dev",
+      "preflights": []
+    },
+    "python": {
+      "live_update_paths": [
+        "src"
+      ],
+      "install_trigger": [
+        "requirements.txt",
+        "pyproject.toml",
+        "Pipfile"
+      ],
+      "install_cmd": "cd /workspace \u0026\u0026 pip install -r requirements.txt 2\u003e/dev/null || true",
+      "run_command": [
+        "/cnb/process/web"
+      ],
+      "buildpacks": [
+        "heroku/python",
+        "heroku/procfile"
+      ],
+      "pack_env": {},
+      "default_process": "",
+      "preflights": []
+    }
+  }
+}

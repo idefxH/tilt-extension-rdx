@@ -21,15 +21,22 @@ Usage: python3 test_builder_cache_flags.py
 import sys
 
 
-def build_cache_args(builder_kind, name):
-    """Mirror of the Tiltfile cache-flag construction.
+def build_cache_args(builder_kind, name, contract_cache_format=''):
+    """Mirror of the Tiltfile cache-flag construction (contract-aware).
 
-    Keep this byte-for-byte aligned with rdx/Tiltfile's build block.
+    Keep this byte-for-byte aligned with rdx/Tiltfile's build block:
+    pack_resolved.cache_format wins when present; the kind rule
+    (heroku = bind, everything else = volume) is the pre-contract
+    fallback.
     """
     cache_dir = '/tmp/rdx-pack-cache-' + name
     cache_vol = 'rdx-pack-cache-' + name
     pack_args = ['pack', 'build', '$EXPECTED_REF']
-    if builder_kind == 'heroku':
+    if contract_cache_format:
+        _cache_fmt = contract_cache_format
+    else:
+        _cache_fmt = 'bind' if builder_kind == 'heroku' else 'volume'
+    if _cache_fmt == 'bind':
         pack_args.extend([
             '--cache', '"type=build;format=bind;source=' + cache_dir + '"',
             '--cache', '"type=launch;format=bind;source=' + cache_dir + '-launch"',
@@ -89,12 +96,27 @@ def test_full_command_strings_printed():
         sys.stdout.write('[%s] %s --builder <img> ...\n' % (kind, cmd))
 
 
+def test_contract_cache_format_overrides_kind_rule():
+    # pack_resolved.cache_format wins over the kind rule in both
+    # directions; empty contract value falls back to the kind rule.
+    joined = ' '.join(build_cache_args('heroku', 'x', 'volume'))
+    _check('format=volume' in joined and 'format=bind' not in joined,
+           'contract volume must override heroku bind: ' + joined)
+    joined = ' '.join(build_cache_args('bci', 'x', 'bind'))
+    _check('format=bind' in joined and 'format=volume' not in joined,
+           'contract bind must override bci volume: ' + joined)
+    joined = ' '.join(build_cache_args('bci', 'x', ''))
+    _check('format=volume' in joined,
+           'empty contract value must keep the kind rule: ' + joined)
+
+
 if __name__ == '__main__':
     failures = 0
     for fn in (test_heroku_uses_bind_cache,
                test_bci_uses_volume_cache,
                test_unknown_builder_falls_back_to_volume,
-               test_full_command_strings_printed):
+               test_full_command_strings_printed,
+               test_contract_cache_format_overrides_kind_rule):
         try:
             fn()
             sys.stdout.write('PASS %s\n' % fn.__name__)

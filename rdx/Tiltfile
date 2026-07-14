@@ -140,6 +140,27 @@ def _contract_builder_image(overlay):
         return ''
     return (overlay.get('builder_resolved') or {}).get('image') or ''
 
+def _contract_pack_block(overlay, language, effective_builder_image):
+    # pack_resolved is computed for (language_resolved.name,
+    # builder_resolved.image) — the bundle SPEC's coupling rule. Consume
+    # it only when THIS evaluation's language and final builder image
+    # match the pair the CLI resolved; any divergence (explicit
+    # builder=/builder_image= override, stale overlay after a language
+    # switch, fresher values) falls back wholesale to the pre-contract
+    # tables — never mix tiers.
+    if not overlay or overlay.get('contract_version', 0) < 1:
+        return None
+    pr = overlay.get('pack_resolved')
+    if not pr:
+        return None
+    lr = overlay.get('language_resolved') or {}
+    if lr.get('name') != language:
+        return None
+    br = (overlay.get('builder_resolved') or {}).get('image') or ''
+    if br != effective_builder_image:
+        return None
+    return pr
+
 def _builder_kind_for_image(image):
     # Contract images are full refs; normalize back to the kind that
     # drives the bci/heroku code paths (cache format, buildpack
@@ -1002,7 +1023,16 @@ def _resolve_image_strategy(
         if _builder_kind != 'bci' and _is_bci_builder_image(builder):
             _builder_kind = 'bci'
 
-        if _builder_kind == 'bci':
+        # pack_resolved (contract v1): the invocation DATA for this
+        # language × the FINAL builder image. None when the pair doesn't
+        # match the overlay (coupling rule) — the kind-conditional
+        # tables below then stay in charge as pre-contract fallbacks.
+        _pack = _contract_pack_block(_overlay, language, builder)
+
+        if _pack != None:
+            # Already resolved for the effective builder (bci → []).
+            buildpacks = (_pack.get('buildpacks') or []) + extra_buildpacks
+        elif _builder_kind == 'bci':
             buildpacks = list(extra_buildpacks)
         else:
             buildpacks = defaults['buildpacks'] + extra_buildpacks
@@ -1059,7 +1089,14 @@ def _resolve_image_strategy(
         cache_dir = '/tmp/rdx-pack-cache-' + name
         cache_vol = 'rdx-pack-cache-' + name
         pack_args = ['pack', 'build', '$EXPECTED_REF']
-        if _builder_kind == 'heroku':
+        # Cache format: contract decision first; the kind rule (heroku =
+        # bind mounts, everything else = volumes) is the pre-contract
+        # fallback. Cache NAMES stay this consumer's convention.
+        if _pack != None and _pack.get('cache_format'):
+            _cache_fmt = _pack.get('cache_format')
+        else:
+            _cache_fmt = 'bind' if _builder_kind == 'heroku' else 'volume'
+        if _cache_fmt == 'bind':
             pack_args.extend([
                 '--cache', '"type=build;format=bind;source=' + cache_dir + '"',
                 '--cache', '"type=launch;format=bind;source=' + cache_dir + '-launch"',
@@ -1080,7 +1117,13 @@ def _resolve_image_strategy(
         if _reload_proc:
             pack_args.extend(['--default-process', _reload_proc])
         else:
-            dev_proc = defaults.get('pack_default_process')
+            # Contract preference first, table as pre-contract fallback;
+            # the Procfile gate below applies to both — passing a
+            # process the Procfile doesn't declare hard-fails the build.
+            if _pack != None:
+                dev_proc = _pack.get('default_process')
+            else:
+                dev_proc = defaults.get('pack_default_process')
             if dev_proc:
                 _procfile_path = build_path + '/Procfile'
                 _has_dev_proc = False
@@ -1092,10 +1135,16 @@ def _resolve_image_strategy(
                             break
                 if _has_dev_proc:
                     pack_args.extend(['--default-process', dev_proc])
-        for k, v in (defaults.get('pack_build_env') or {}).items():
-            pack_args.extend(['--env', '%s=%s' % (k, v)])
-        for k, v in (BUILDER_BUILD_ENV.get(_builder_kind, {}).get(language, {}) or {}).items():
-            pack_args.extend(['--env', '%s=%s' % (k, v)])
+        if _pack != None:
+            # Contract static env — already the (language, builder-kind)
+            # union incl. the BCI layer. Dynamic knobs below stay code.
+            for k, v in (_pack.get('env') or {}).items():
+                pack_args.extend(['--env', '%s=%s' % (k, v)])
+        else:
+            for k, v in (defaults.get('pack_build_env') or {}).items():
+                pack_args.extend(['--env', '%s=%s' % (k, v)])
+            for k, v in (BUILDER_BUILD_ENV.get(_builder_kind, {}).get(language, {}) or {}).items():
+                pack_args.extend(['--env', '%s=%s' % (k, v)])
         if _builder_kind == 'bci':
             _bci_env = _resolve_bci_build_env(
                 language, live_reload, _reload_supported, node_version,
@@ -1139,7 +1188,14 @@ def _resolve_image_strategy(
         pack_cmd_base = ' '.join(pack_args)
         pack_cmd = pack_cmd_base + ' --path ' + build_path
 
-        if language == 'go' and os.path.exists('go.mod'):
+        # Preflights: contract names first (unknown names ignored —
+        # forward-compat), language rule as pre-contract fallback. The
+        # go-mod-tidy IMPLEMENTATION is invocation code and stays here.
+        if _pack != None:
+            _wants_go_tidy = 'go-mod-tidy' in (_pack.get('preflights') or [])
+        else:
+            _wants_go_tidy = language == 'go'
+        if _wants_go_tidy and os.path.exists('go.mod'):
             local(
                 "set -e; " +
                 "if ! command -v go >/dev/null 2>&1; then " +
