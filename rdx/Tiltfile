@@ -543,6 +543,17 @@ def _detect_lib_key(chart_path):
 # public hostname lands on the ingress controller, which then routes by
 # Host header exactly as it does for external traffic.
 #
+# The snippet's zone header must carry the SAME PORT the main server
+# block listens on: a CoreDNS server block binds its own listener, so a
+# `domain:53` snippet on a cluster whose CoreDNS serves `.:1053`
+# (vcluster does this behind the kube-dns Service) binds a listener
+# nothing routes to and the override is silently inert. The port is
+# parsed from the kube-system/coredns Corefile (_coredns_serving_port),
+# defaulting to 53 — stock k3s / Rancher Desktop. No CoreDNS restart is
+# needed either way: kubelet projects the ConfigMap into the optional
+# mount within ~a minute and the `reload` plugin picks up the new
+# import (verified: activation ≈35 s after apply on a fresh cluster).
+#
 # The ConfigMap is applied via k8s_yaml() so Tilt owns its lifecycle:
 # created at `tilt up`, deleted at `tilt down`. The fixed name
 # `coredns-custom` is a k3s convention (it's the specific name k3s
@@ -633,7 +644,41 @@ def _ingress_cluster_ip():
     return ip
 
 
-def _coredns_hairpin_yaml(domain, ip, workspace):
+def _coredns_serving_port():
+    """Port the cluster CoreDNS main server block listens on ('53' on k3s).
+
+    A CoreDNS server block BINDS the port in its zone header — imported
+    snippets included. On stock k3s / Rancher Desktop the main block is
+    `.:53` so a `domain:53` snippet shares its listener, but some
+    distributions serve on an alternate port behind the kube-dns Service
+    (vcluster: `.:1053`); a `:53` snippet there starts a second listener
+    nothing routes to and the override is silently inert. Parse the port
+    out of the conventional kube-system/coredns Corefile; fall back to
+    53 whenever anything about the convention doesn't hold.
+
+    Same /tmp cache pattern as _ingress_cluster_ip() above (issue #7
+    M3): one kubectl round-trip per cluster, keyed on the k8s context.
+    """
+    _cache = '/tmp/rdx-coredns-port-' + k8s_context().replace('/', '_')
+    port = str(local(
+        '_cf="' + _cache + '"; ' +
+        'if [ -s "$_cf" ]; then cat "$_cf"; else ' +
+        "p=$(kubectl get cm coredns -n kube-system " +
+        "-o jsonpath='{.data.Corefile}' 2>/dev/null | " +
+        "sed -n 's/^[^#][^ ]*:\\([0-9][0-9]*\\)[[:space:]]*{.*/\\1/p' | " +
+        'head -1); ' +
+        '[ -z "$p" ] && p=53; ' +
+        'printf "%s" "$p" > "$_cf"; ' +
+        'echo "$p"; ' +
+        'fi',
+        quiet=True, echo_off=True,
+    )).strip()
+    if not port.isdigit():
+        return '53'
+    return port
+
+
+def _coredns_hairpin_yaml(domain, ip, workspace, port):
     """Render the `coredns-custom` ConfigMap manifest as a string.
 
     The `{{ .Name }}` token in the CoreDNS `template` plugin is a Go
@@ -654,12 +699,12 @@ metadata:
     rdx.io/workspace: "%s"
 data:
   %s.server: |
-    %s:53 {
+    %s:%s {
         template IN A %s {
             answer "{{ .Name }} 60 IN A %s"
         }
     }
-""" % (workspace, slug, domain, domain, ip)
+""" % (workspace, slug, domain, port, domain, ip)
 
 
 # ─── Session-wide singletons ───────────────────────────────────────────
@@ -785,9 +830,11 @@ def _apply_coredns_hairpin(domain, workspace):
                  'manages a single hairpin mapping — align `domain` ' +
                  'across the workspace values.yaml files.')
         return
+    port = _coredns_serving_port()
     print('[rdx] hairpin DNS: pointing *.' + domain + ' at ingress ' +
-          'ClusterIP ' + ip + ' via coredns-custom (kube-system).')
-    k8s_yaml(blob(_coredns_hairpin_yaml(domain, ip, workspace)))
+          'ClusterIP ' + ip + ' via coredns-custom (kube-system' +
+          (', coredns port ' + port if port != '53' else '') + ').')
+    k8s_yaml(blob(_coredns_hairpin_yaml(domain, ip, workspace, port)))
 
 
 # ═══════════════════════════════════════════════════════════════════════
