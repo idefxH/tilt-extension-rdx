@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Extension test suite ──────────────────────────────────────────────
+  # The tests are source-pinning tests: each one reads rdx/Tiltfile (or a
+  # helper script) and asserts the wiring that fixed a shipped bug is
+  # still in place — session-once guards, kube preflight, declared-build
+  # consumer, filter-enabled-deps, BCI knobs. Pure python: no cluster,
+  # no tilt binary, no docker. PyYAML is needed by the filter tests
+  # (the helper scripts they exercise import yaml).
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install test deps
+        run: python3 -m pip install pytest pyyaml
+
+      - name: Helper scripts compile
+        # The rdx/_*.py helpers run inside developers' `tilt up` via
+        # python3; a syntax error there breaks every load. compileall
+        # is the cheapest possible guard and also covers hooks the
+        # tests don't import directly.
+        run: python3 -m compileall -q rdx/
+
+      - name: pytest
+        run: python3 -m pytest tests/ -q
