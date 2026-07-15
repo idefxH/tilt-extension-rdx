@@ -32,6 +32,11 @@ def test_legacy_pack_path_publishes_in_push_mode():
             "tilt must not push the pack image itself")
     _expect("skips_local_docker=False" not in body,
             "no pack registration may re-enter the daemon-export path")
+    cache_gate = body.index("_cache_fmt = 'volume'\n",
+                            body.index("RDX_TILT_PUSH_TO_REGISTRY"))
+    _expect(cache_gate < body.index("if _cache_fmt == 'bind':"),
+            "publish mode must force volume caches before the flag emit "
+            "(bind sources cannot be chowned by the builder user)")
     print("ok  test_legacy_pack_path_publishes_in_push_mode")
 
 

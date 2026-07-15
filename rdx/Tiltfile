@@ -1174,6 +1174,14 @@ def _resolve_image_strategy(
             _cache_fmt = _pack.get('cache_format')
         else:
             _cache_fmt = 'bind' if _builder_kind == 'heroku' else 'volume'
+        # Push mode publishes from pack (--publish below): every
+        # lifecycle phase then runs as the builder user and the root
+        # chown helper cannot fix up bind sources ("failed to chown
+        # volumes"), so publish mode always rides daemon-managed volume
+        # caches. The contract's bind preference keeps applying to the
+        # daemon-export path.
+        if os.getenv('RDX_TILT_PUSH_TO_REGISTRY') == '1':
+            _cache_fmt = 'volume'
         if _cache_fmt == 'bind':
             pack_args.extend([
                 '--cache', '"type=build;format=bind;source=' + cache_dir + '"',
