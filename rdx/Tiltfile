@@ -1291,8 +1291,18 @@ def _resolve_image_strategy(
         deps = sync_paths if sync_paths else ['.']
 
         _local_push = os.getenv('RDX_TILT_PUSH_TO_REGISTRY') == '1'
-        _skips_local_docker = not _local_push
-        _disable_push = not _local_push
+        if _local_push:
+            # Publish straight from pack: the daemon-export path breaks
+            # on daemons running the containerd image store — current
+            # Docker Desktop's default — with "no suitable export target
+            # found" on the run image. --publish writes EXPECTED_REF to
+            # the registry with no daemon round-trip, so Tilt must
+            # neither expect the image in the local daemon nor push it
+            # again itself.
+            pack_cmd_base += ' --publish'
+            pack_cmd += ' --publish'
+        _skips_local_docker = True
+        _disable_push = True
 
         if _workloads:
             for _wl in _workloads:
@@ -2045,12 +2055,17 @@ def _register_declared_build(name, parsed_values, _lib_key, language,
             _bb = block.get('builder', '') or _RDX_DEFAULT_BUILDER or 'heroku'
             _builder_img = ('ghcr.io/idefxh/builder-bci-base'
                             if _bb == 'bci' else 'heroku/builder:24')
+        # Same containerd-image-store rule as the legacy pack path:
+        # push mode publishes from pack and Tilt stays out of the
+        # daemon entirely.
+        _pub = os.getenv('RDX_TILT_PUSH_TO_REGISTRY') == '1'
         custom_build(
             repo,
             'pack build $EXPECTED_REF --builder ' + _builder_img +
-            ' --path ' + context,
+            ' --path ' + context + (' --publish' if _pub else ''),
             deps=[context],
-            skips_local_docker=False,
+            skips_local_docker=_pub,
+            disable_push=_pub,
         )
         print('[rdx] %s: building %s from %s (buildpack %s, declared)' %
               (name, repo, context, _builder_kind_for_image(_builder_img)))
