@@ -48,7 +48,22 @@ def test_declared_buildpack_publishes_in_push_mode():
     print("ok  test_declared_buildpack_publishes_in_push_mode")
 
 
+def test_registry_from_cluster_knob():
+    """RDX_REGISTRY_FROM_CLUSTER carries the node-side registry name on
+    remote-daemon setups; unset must leave the single-host behaviour."""
+    src = _src()
+    _expect("RDX_REGISTRY_FROM_CLUSTER" in src,
+            "the cluster-side registry knob must exist")
+    seg = src.split("RDX_REGISTRY_FROM_CLUSTER", 1)[1]
+    _expect("host_from_cluster=" in seg.split('\ndef ', 1)[0],
+            "the knob must map to default_registry(host_from_cluster=...)")
+    _expect("default_registry(_rdx_default_registry)" in src,
+            "unset knob must keep the single-host registration")
+    print("ok  test_registry_from_cluster_knob")
+
+
 if __name__ == '__main__':
     test_legacy_pack_path_publishes_in_push_mode()
     test_declared_buildpack_publishes_in_push_mode()
+    test_registry_from_cluster_knob()
     print("\nAll pack-publish tests passed.")

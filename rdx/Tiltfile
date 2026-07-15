@@ -446,8 +446,19 @@ LANGUAGE_DEFAULTS = {
 # image builds are registered, so it has to run at extension load
 # time — not inside rdx_app().
 _rdx_default_registry = os.getenv('RDX_DEFAULT_REGISTRY', '')
+# Two-audience registries (optional): on remote-daemon setups the
+# laptop often reaches the registry on a different host:port than the
+# cluster nodes do (port-forwards, mirrors). RDX_REGISTRY_FROM_CLUSTER
+# then carries the node-side name: pushes go to RDX_DEFAULT_REGISTRY,
+# the rendered image refs use the cluster-side host. Unset = both
+# audiences share RDX_DEFAULT_REGISTRY, unchanged.
+_rdx_registry_from_cluster = os.getenv('RDX_REGISTRY_FROM_CLUSTER', '')
 if _rdx_default_registry:
-    default_registry(_rdx_default_registry)
+    if _rdx_registry_from_cluster:
+        default_registry(_rdx_default_registry,
+                         host_from_cluster=_rdx_registry_from_cluster)
+    else:
+        default_registry(_rdx_default_registry)
 
 # Disable Tilt's secret-value scrubber for binding-secret values.
 #
