@@ -24,8 +24,11 @@ def test_legacy_pack_path_publishes_in_push_mode():
     body = _src().split('def _resolve_image_strategy(',
                         1)[1].split('\ndef ', 1)[0]
     gate = body.index("RDX_TILT_PUSH_TO_REGISTRY")
-    _expect("--publish" in body[gate:],
-            "push mode must append --publish to the pack invocation")
+    _expect("--publish --network host" in body[gate:],
+            "push mode must append --publish with --network host: the "
+            "lifecycle writes to the registry from the container, and "
+            "localhost-published registries only resolve in the "
+            "daemon's network namespace")
     _expect("_skips_local_docker = True" in body,
             "tilt must not expect the pack image in the local daemon")
     _expect("_disable_push = True" in body,
@@ -44,8 +47,8 @@ def test_declared_buildpack_publishes_in_push_mode():
     body = _src().split('def _register_declared_build(',
                         1)[1].split('\ndef ', 1)[0]
     seg = body.split('custom_build(', 1)[1]
-    _expect("--publish" in seg,
-            "declared buildpack must publish in push mode")
+    _expect("--publish --network host" in seg,
+            "declared buildpack must publish (host network) in push mode")
     _expect("skips_local_docker=_pub" in seg,
             "declared buildpack must skip the daemon when publishing")
     _expect("disable_push=_pub" in seg,

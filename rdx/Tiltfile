@@ -1318,8 +1318,13 @@ def _resolve_image_strategy(
             # the registry with no daemon round-trip, so Tilt must
             # neither expect the image in the local daemon nor push it
             # again itself.
-            pack_cmd_base += ' --publish'
-            pack_cmd += ' --publish'
+            # --network host: with --publish the analyzer/exporter
+            # write to the registry FROM the lifecycle container, and
+            # localhost-published registries (kind-mirror pattern, the
+            # daemon host's loopback) are only reachable from the
+            # daemon's own network namespace.
+            pack_cmd_base += ' --publish --network host'
+            pack_cmd += ' --publish --network host'
         _skips_local_docker = True
         _disable_push = True
 
@@ -2081,7 +2086,8 @@ def _register_declared_build(name, parsed_values, _lib_key, language,
         custom_build(
             repo,
             'pack build $EXPECTED_REF --builder ' + _builder_img +
-            ' --path ' + context + (' --publish' if _pub else ''),
+            ' --path ' + context +
+            (' --publish --network host' if _pub else ''),
             deps=[context],
             skips_local_docker=_pub,
             disable_push=_pub,
