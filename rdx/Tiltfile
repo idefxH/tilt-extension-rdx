@@ -1023,6 +1023,26 @@ def _resolve_image_strategy(
             _img_repo = image_ref
             _img_tag = 'latest'
     else:
+        # Declared non-buildpack build (DO-0016): when the live values
+        # carry a build: block whose strategy isn't 'buildpack', the
+        # block drives the image — the declared-build consumer registers
+        # it against the workload's deployed ref after projection.
+        # Registering the legacy pack path here would build the wrong
+        # image AND collide with that registration on the same ref, so
+        # the language argument stays a language marker only.
+        _declared = (_early_values.get('build', {}) or {})
+        if not _declared:
+            _declared = (_early_lib.get('build', {}) or {})
+        _declared_strategy = _declared.get('strategy', '')
+        if _declared_strategy and _declared_strategy != 'buildpack':
+            print(('[rdx] %s: values declare a %s build — the declared ' +
+                   'block drives the image; language=%r is a language ' +
+                   'marker only.') % (name, _declared_strategy, language))
+            return {
+                'builder_kind': None,
+                'img_repo': '',
+                'img_tag': '',
+            }
         defaults = LANGUAGE_DEFAULTS[language]
 
         # Contract v1: prefer the overlay's resolved blocks. The
@@ -1966,21 +1986,21 @@ def _register_declared_build(name, parsed_values, _lib_key, language,
     if not block:
         return
     # Legacy precedence: an explicit language arg means the pack path
-    # already registered this project's build in the image phase.
+    # already registered this project's build in the image phase —
+    # but only when the two AGREE (buildpack block). On a disagreement
+    # the image phase yielded for exactly this case, so the declared
+    # block falls through and registers here.
     if language and not helm_only and not image_ref:
         # Migration window: fresh imports write a buildpack block AND
         # keep language= on rdx_app(). When the two agree the legacy
         # pack path simply keeps driving — same builder chain, same
-        # semantics — so stay silent; warn only on a real disagreement
-        # (e.g. the dev switched the block to dockerfile but the
-        # scaffolded language= is still in place).
-        if block.get('strategy', '') != 'buildpack':
-            warn(('[rdx] %s: values declare a %s build but rdx_app() ' +
-                  'passes language=%r — the legacy pack path stays in ' +
-                  'charge. Drop the language argument to let the ' +
-                  'block drive the build.')
-                 % (name, block.get('strategy', ''), language))
-        return
+        # semantics — so stay silent and leave it in charge.
+        if block.get('strategy', '') == 'buildpack':
+            return
+        print(('[rdx] %s: values declare a %s build — the declared ' +
+               'block drives the image; the scaffolded language=%r ' +
+               'argument no longer selects the build path.')
+              % (name, block.get('strategy', ''), language))
     repo = str(image.get('repository') or '')
     if not repo and image_ref:
         repo = image_ref.rsplit(':', 1)[0]

@@ -30,6 +30,31 @@ def test_declared_build_wiring():
     print("ok  test_declared_build_wiring")
 
 
+def test_declared_dockerfile_overrides_language_marker():
+    """A non-buildpack declared block drives the build even when the
+    scaffolded rdx_app(language=...) argument is still in place: the
+    image phase yields before the pack path, and the consumer falls
+    through instead of deferring. Otherwise `rdx new` followed by
+    `rdx project build --strategy dockerfile` pack-builds the template
+    source and the declaration is silently ignored."""
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            '..', 'rdx', 'Tiltfile')).read()
+    img = src.split('def _resolve_image_strategy(', 1)[1].split('\ndef ', 1)[0]
+    _expect("_declared_strategy != 'buildpack'" in img,
+            "image phase must gate the legacy pack path on the declared strategy")
+    _expect(img.index("_declared_strategy != 'buildpack'")
+            < img.index('LANGUAGE_DEFAULTS[language]'),
+            "the declared-build gate must run before the pack path engages")
+    body = src.split('def _register_declared_build(', 1)[1].split('\ndef ', 1)[0]
+    pre = body.split('docker_build(')[0]
+    _expect("== 'buildpack'" in pre,
+            "consumer's early return must be scoped to buildpack agreement")
+    _expect('return' in pre[pre.index("== 'buildpack'"):],
+            "buildpack agreement must still defer to the legacy pack path")
+    print("ok  test_declared_dockerfile_overrides_language_marker")
+
+
 if __name__ == '__main__':
     test_declared_build_wiring()
+    test_declared_dockerfile_overrides_language_marker()
     print("\nAll declared-build tests passed.")
